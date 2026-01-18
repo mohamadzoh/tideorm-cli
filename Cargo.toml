@@ -1,0 +1,65 @@
+[package]
+name = "tideorm-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line interface for TideORM"
+authors = ["Mohamad Al Zohbie"]
+license = "MIT"
+repository = "https://github.com/mohamadzoh/tideorm"
+keywords = ["orm", "cli", "database", "migration", "rust"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "tideorm"
+path = "src/main.rs"
+
+[dependencies]
+# CLI Framework
+clap = { version = "4.4", features = ["derive", "env", "color"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9.8"
+
+# File system
+walkdir = "2.4"
+
+# Time
+chrono = "0.4"
+
+# Colors for terminal output
+colored = "3.1.1"
+
+# Regex for parsing
+regex = "1.10"
+
+# String case conversion
+heck = "0.5.0"
+
+# Pluralization
+pluralizer = "0.5.0"
+
+# Template engine for code generation
+minijinja = "2.14.0"
+
+# Dialoguer for interactive prompts
+dialoguer = "0.12.0"
+
+# Indicatif for progress bars
+indicatif = "0.18.3"
+
+# Console utilities
+console = "0.16.2"
+
+[features]
+default = []
+# runtime = ["tideorm"]
+
+[dev-dependencies]
+tempfile = "3.9"
+assert_cmd = "2.0"
+predicates = "3.0"
