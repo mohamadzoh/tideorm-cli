@@ -3,18 +3,7 @@
 A comprehensive command-line interface for TideORM - A powerful Rust ORM.
 
 ## Installation
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-tideorm = "0.1"
-
-[dev-dependencies]
-tideorm-cli = "0.1"
-```
-
-Or install globally:
+install globally:
 
 ```bash
 cargo install tideorm-cli
