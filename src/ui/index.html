@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TideORM Studio</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="wave-bg"></div>
+    
+    <!-- Alert Banner for missing config -->
+    <div id="config-alert" class="alert-banner warning hidden">
+        <span class="alert-icon">⚠️</span>
+        <span><strong>No tideorm.toml found!</strong> Some features are disabled. Run <code>tideorm init</code> to create a project configuration.</span>
+    </div>
+    
+    <header>
+        <div class="logo">
+            <div class="logo-icon">🌊</div>
+            <div>
+                <h1>TideORM Studio</h1>
+                <span>Visual Database Management</span>
+            </div>
+        </div>
+        <div class="header-status">
+            <span id="status-badge" class="badge badge-success">● Connected</span>
+        </div>
+    </header>
+
+    <nav class="nav-tabs">
+        <button class="nav-tab active" data-panel="dashboard" onclick="switchPanel('dashboard')">🏠 Dashboard</button>
+        <button class="nav-tab" data-panel="generators" onclick="switchPanel('generators')">⚙️ Generators</button>
+        <button class="nav-tab" data-panel="migrations" onclick="switchPanel('migrations')">📦 Migrations</button>
+        <button class="nav-tab" data-panel="seeders" onclick="switchPanel('seeders')">🌱 Seeders</button>
+        <button class="nav-tab" data-panel="query" onclick="switchPanel('query')">🔍 Query Playground</button>
+        <button class="nav-tab" data-panel="database" onclick="switchPanel('database')">🗄️ Database</button>
+    </nav>
+
+    <main>
+        <!-- Dashboard Panel -->
+        <section id="panel-dashboard" class="panel active">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">🌊</div>
+                    <h2>Welcome to TideORM Studio</h2>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 1.5rem;">
+                    Your visual interface for managing TideORM projects. Generate models, run migrations, seed data, and execute queries—all from one place.
+                </p>
+                <div class="actions-grid">
+                    <div class="action-card cli-required" onclick="switchPanel('generators')">
+                        <div class="action-card-icon">🏗️</div>
+                        <h3>Generate Model</h3>
+                        <p>Create new models with fields</p>
+                    </div>
+                    <div class="action-card cli-required" onclick="switchPanel('migrations')">
+                        <div class="action-card-icon">📦</div>
+                        <h3>Run Migrations</h3>
+                        <p>Apply database changes</p>
+                    </div>
+                    <div class="action-card cli-required" onclick="switchPanel('seeders')">
+                        <div class="action-card-icon">🌱</div>
+                        <h3>Seed Data</h3>
+                        <p>Populate with test data</p>
+                    </div>
+                    <div class="action-card" onclick="switchPanel('query')">
+                        <div class="action-card-icon">🔍</div>
+                        <h3>Query Playground</h3>
+                        <p>Execute SQL queries</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">⚡</div>
+                    <h2>Quick Actions</h2>
+                </div>
+                <div class="actions-grid">
+                    <div class="action-card cli-required" onclick="runCommand('migrate', 'migrate')">
+                        <div class="action-card-icon">▶️</div>
+                        <h3>Migrate</h3>
+                        <p>Run pending migrations</p>
+                    </div>
+                    <div class="action-card cli-required" onclick="runCommand('migrate rollback', 'migrate rollback')">
+                        <div class="action-card-icon">⏪</div>
+                        <h3>Rollback</h3>
+                        <p>Undo last migration</p>
+                    </div>
+                    <div class="action-card cli-required" onclick="runCommand('db seed', 'db seed')">
+                        <div class="action-card-icon">🌱</div>
+                        <h3>Seed</h3>
+                        <p>Run all seeders</p>
+                    </div>
+                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate fresh', 'Migrate Fresh', 'This will drop ALL tables and re-run all migrations. All data will be lost!')">
+                        <div class="action-card-icon">🔄</div>
+                        <h3>Fresh Migrate</h3>
+                        <p>Drop all & re-migrate</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Generators Panel -->
+        <section id="panel-generators" class="panel">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">🏗️</div>
+                    <h2>Model Generator</h2>
+                </div>
+                <form id="model-form" onsubmit="generateModel(event)">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="model-name">Model Name *</label>
+                            <input type="text" id="model-name" placeholder="e.g., User, BlogPost" required class="cli-input">
+                        </div>
+                        <div class="form-group">
+                            <label for="table-name">Table Name (optional)</label>
+                            <input type="text" id="table-name" placeholder="Auto-generated if empty" class="cli-input">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="fields">Fields</label>
+                        <input type="text" id="fields" placeholder="name:string,email:string:unique,age:integer:nullable" class="cli-input">
+                        <small style="color: var(--text-secondary);">Format: name:type[:modifiers] separated by commas</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="relations">Relations</label>
+                            <input type="text" id="relations" placeholder="posts:hasMany:Post,profile:hasOne:Profile" class="cli-input">
+                        </div>
+                        <div class="form-group">
+                            <label for="indexes">Indexes</label>
+                            <input type="text" id="indexes" placeholder="email,created_at:desc" class="cli-input">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Options</label>
+                        <div class="checkbox-group">
+                            <label class="checkbox-item">
+                                <input type="checkbox" id="opt-timestamps" checked class="cli-input">
+                                <span>Timestamps</span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" id="opt-soft-delete" class="cli-input">
+                                <span>Soft Delete</span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" id="opt-migration" checked class="cli-input">
+                                <span>Create Migration</span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" id="opt-factory" class="cli-input">
+                                <span>Create Factory</span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" id="opt-seeder" class="cli-input">
+                                <span>Create Seeder</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 1rem;">
+                        <button type="submit" class="btn btn-primary cli-btn">
+                            <span>🚀</span> Generate Model
+                        </button>
+                        <button type="button" class="btn btn-secondary" onclick="previewCommand()">
+                            <span>👁️</span> Preview Command
+                        </button>
+                    </div>
+                </form>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📝</div>
+                    <h2>Other Generators</h2>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="migration-name">Migration Name</label>
+                        <input type="text" id="migration-name" placeholder="e.g., add_status_to_users" class="cli-input">
+                    </div>
+                    <div class="form-group" style="display: flex; align-items: flex-end;">
+                        <button class="btn btn-primary cli-btn" onclick="generateMigration()">
+                            <span>📦</span> Create Migration
+                        </button>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="seeder-name">Seeder Name</label>
+                        <input type="text" id="seeder-name" placeholder="e.g., UserSeeder" class="cli-input">
+                    </div>
+                    <div class="form-group" style="display: flex; align-items: flex-end;">
+                        <button class="btn btn-primary cli-btn" onclick="generateSeeder()">
+                            <span>🌱</span> Create Seeder
+                        </button>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="factory-name">Factory Name</label>
+                        <input type="text" id="factory-name" placeholder="e.g., UserFactory" class="cli-input">
+                    </div>
+                    <div class="form-group" style="display: flex; align-items: flex-end;">
+                        <button class="btn btn-primary cli-btn" onclick="generateFactory()">
+                            <span>🏭</span> Create Factory
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📋</div>
+                    <h2>Command Output</h2>
+                </div>
+                <div id="generator-output" class="output-area">
+                    Ready to generate... Output will appear here.
+                </div>
+            </div>
+        </section>
+
+        <!-- Migrations Panel -->
+        <section id="panel-migrations" class="panel">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📦</div>
+                    <h2>Migration Commands</h2>
+                </div>
+                <div class="actions-grid">
+                    <div class="action-card cli-required" onclick="runCommand('migrate', 'migrate')">
+                        <div class="action-card-icon">▶️</div>
+                        <h3>Run Migrations</h3>
+                        <p>Apply all pending migrations</p>
+                    </div>
+                    <div class="action-card cli-required" onclick="runCommand('migrate rollback', 'migrate rollback')">
+                        <div class="action-card-icon">⏪</div>
+                        <h3>Rollback</h3>
+                        <p>Undo the last batch</p>
+                    </div>
+                    <div class="action-card cli-required" onclick="runCommand('migrate status', 'migrate status')">
+                        <div class="action-card-icon">📊</div>
+                        <h3>Status</h3>
+                        <p>View migration status</p>
+                    </div>
+                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate fresh', 'Fresh Migration', 'This will DROP ALL TABLES and re-run all migrations from scratch. All data will be permanently lost!')">
+                        <div class="action-card-icon">🔄</div>
+                        <h3>Fresh</h3>
+                        <p>Drop all & re-migrate</p>
+                    </div>
+                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate reset', 'Reset Migrations', 'This will roll back ALL migrations. All tables will be dropped!')">
+                        <div class="action-card-icon">⏮️</div>
+                        <h3>Reset</h3>
+                        <p>Roll back all migrations</p>
+                    </div>
+                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate refresh', 'Refresh Migrations', 'This will reset and re-run all migrations. All data will be lost!')">
+                        <div class="action-card-icon">🔃</div>
+                        <h3>Refresh</h3>
+                        <p>Reset & re-run all</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📋</div>
+                    <h2>Migration Output</h2>
+                </div>
+                <div id="migration-output" class="output-area">
+                    Ready... Output will appear here.
+                </div>
+            </div>
+        </section>
+
+        <!-- Seeders Panel -->
+        <section id="panel-seeders" class="panel">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">🌱</div>
+                    <h2>Seeder Commands</h2>
+                </div>
+                <div class="actions-grid">
+                    <div class="action-card cli-required" onclick="runCommand('db seed', 'db seed')">
+                        <div class="action-card-icon">🌱</div>
+                        <h3>Run All Seeders</h3>
+                        <p>Execute all database seeders</p>
+                    </div>
+                    <div class="action-card danger cli-required" onclick="confirmDangerous('db seed --fresh', 'Fresh Seed', 'This will truncate all tables before seeding. All existing data will be deleted!')">
+                        <div class="action-card-icon">🔄</div>
+                        <h3>Fresh Seed</h3>
+                        <p>Truncate & re-seed all</p>
+                    </div>
+                </div>
+                
+                <div class="form-group" style="margin-top: 1.5rem;">
+                    <label for="specific-seeder">Run Specific Seeder</label>
+                    <div style="display: flex; gap: 1rem;">
+                        <input type="text" id="specific-seeder" placeholder="e.g., UserSeeder" style="flex: 1;" class="cli-input">
+                        <button class="btn btn-primary cli-btn" onclick="runSpecificSeeder()">
+                            <span>▶️</span> Run
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📋</div>
+                    <h2>Seeder Output</h2>
+                </div>
+                <div id="seeder-output" class="output-area">
+                    Ready... Output will appear here.
+                </div>
+            </div>
+        </section>
+
+        <!-- Query Playground Panel -->
+        <section id="panel-query" class="panel">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">🔍</div>
+                    <h2>SQL Query Playground</h2>
+                </div>
+                <div class="query-editor">
+                    <div class="editor-toolbar">
+                        <span style="color: var(--text-secondary); font-size: 0.85rem;">Enter your SQL query below</span>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn btn-secondary" onclick="clearQuery()" style="padding: 0.5rem 1rem; font-size: 0.85rem;">
+                                Clear
+                            </button>
+                            <button class="btn btn-primary" onclick="executeQuery()" style="padding: 0.5rem 1rem; font-size: 0.85rem;">
+                                <span>▶️</span> Execute
+                            </button>
+                        </div>
+                    </div>
+                    <textarea id="query-input" class="editor-textarea" placeholder="SELECT * FROM users LIMIT 10;"></textarea>
+                </div>
+                
+                <div class="results-panel">
+                    <div class="results-header">
+                        <span style="color: var(--text-secondary); font-size: 0.9rem;">📊 Results</span>
+                        <span id="query-time" style="color: var(--text-secondary); font-size: 0.85rem;"></span>
+                    </div>
+                    <div id="query-results" class="results-content">
+                        Results will appear here after executing a query.
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📚</div>
+                    <h2>Quick Queries</h2>
+                </div>
+                <div class="actions-grid">
+                    <div class="action-card" onclick="setQuery('SELECT name FROM sqlite_master WHERE type=\\'table\\';')">
+                        <div class="action-card-icon">📋</div>
+                        <h3>List Tables</h3>
+                        <p>Show all tables</p>
+                    </div>
+                    <div class="action-card" onclick="setQuery('SELECT * FROM users LIMIT 10;')">
+                        <div class="action-card-icon">👥</div>
+                        <h3>Sample Users</h3>
+                        <p>First 10 users</p>
+                    </div>
+                    <div class="action-card danger" onclick="confirmDangerousQuery('DROP TABLE IF EXISTS test;', 'Drop Table', 'This will permanently delete the table and all its data!')">
+                        <div class="action-card-icon">🗑️</div>
+                        <h3>Drop Table</h3>
+                        <p>Delete a table</p>
+                    </div>
+                    <div class="action-card danger" onclick="confirmDangerousQuery('DELETE FROM users WHERE 1=1;', 'Delete All', 'This will delete ALL rows from the users table!')">
+                        <div class="action-card-icon">⚠️</div>
+                        <h3>Delete All</h3>
+                        <p>Clear table data</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Database Panel -->
+        <section id="panel-database" class="panel">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">🗄️</div>
+                    <h2>Database Operations</h2>
+                </div>
+                <div class="actions-grid">
+                    <div class="action-card cli-required" onclick="runCommand('db status', 'db status')">
+                        <div class="action-card-icon">📊</div>
+                        <h3>Status</h3>
+                        <p>Check connection status</p>
+                    </div>
+                    <div class="action-card danger cli-required" onclick="confirmDangerous('db wipe', 'Wipe Database', 'This will DROP ALL TABLES in the database. This action cannot be undone!')">
+                        <div class="action-card-icon">💥</div>
+                        <h3>Wipe</h3>
+                        <p>Drop all tables</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-icon">📋</div>
+                    <h2>Database Output</h2>
+                </div>
+                <div id="database-output" class="output-area">
+                    Ready... Output will appear here.
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>TideORM Studio • Built with 🌊 by the TideORM Team</p>
+    </footer>
+
+    <!-- Confirmation Modal -->
+    <div id="confirm-modal" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header danger">
+                <span style="font-size: 2rem;">⚠️</span>
+                <h3 id="modal-title">Confirm Action</h3>
+            </div>
+            <div class="modal-body">
+                <p id="modal-message">Are you sure you want to proceed?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button id="modal-confirm-btn" class="btn btn-danger" onclick="confirmModalAction()">
+                    <span>⚠️</span> Confirm
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

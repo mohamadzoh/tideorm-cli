@@ -96,6 +96,21 @@ enum Commands {
         #[arg(short, long)]
         table: Option<String>,
     },
+
+    // =========================================================================
+    // WEB UI
+    // =========================================================================
+    /// Launch TideORM Studio - Web-based UI for TideORM
+    #[command(name = "ui", alias = "studio")]
+    Ui {
+        /// Host address to bind to
+        #[arg(short = 'H', long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to run the server on
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,25 +387,6 @@ enum MakeCommands {
         #[arg(short, long, default_value = "src/factories")]
         output: String,
     },
-
-    /// Generate a new controller/handler
-    #[command(name = "controller")]
-    Controller {
-        /// Controller name
-        name: String,
-
-        /// Model to create CRUD for
-        #[arg(short, long)]
-        model: Option<String>,
-
-        /// Generate resource controller (all CRUD operations)
-        #[arg(short, long)]
-        resource: bool,
-
-        /// Output directory
-        #[arg(short = 'd', long, default_value = "src/handlers")]
-        output: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -486,6 +482,9 @@ async fn main() {
         }
         Commands::Schema { table } => {
             commands::schema::show(&cli.config, table, cli.verbose).await
+        }
+        Commands::Ui { host, port } => {
+            commands::ui::run(&host, port, cli.verbose).await
         }
     };
 

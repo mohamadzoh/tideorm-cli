@@ -2,7 +2,7 @@
 
 use crate::config::TideConfig;
 use crate::generators::{
-    controller::ControllerGenerator, factory::FactoryGenerator, migration::MigrationGenerator,
+    factory::FactoryGenerator, migration::MigrationGenerator,
     model::ModelGenerator, seeder::SeederGenerator,
 };
 use crate::utils::{print_info, print_success};
@@ -73,13 +73,6 @@ pub async fn handle(config_path: &str, cmd: MakeCommands, verbose: bool) -> Resu
             model,
             output,
         } => make_factory(config_path, &name, model, &output, verbose).await,
-
-        MakeCommands::Controller {
-            name,
-            model,
-            resource,
-            output,
-        } => make_controller(config_path, &name, model, resource, &output, verbose).await,
     }
 }
 
@@ -232,29 +225,6 @@ async fn make_factory(
     let path = generator.generate(name, model)?;
 
     print_success(&format!("Created factory: {}", path));
-
-    Ok(())
-}
-
-/// Generate a new controller
-async fn make_controller(
-    config_path: &str,
-    name: &str,
-    model: Option<String>,
-    resource: bool,
-    _output: &str,
-    verbose: bool,
-) -> Result<(), String> {
-    let config = TideConfig::load_or_default(config_path);
-
-    if verbose {
-        print_info(&format!("Generating controller: {}", name));
-    }
-
-    let generator = ControllerGenerator::new(&config);
-    let path = generator.generate(name, model, resource)?;
-
-    print_success(&format!("Created controller: {}", path));
 
     Ok(())
 }
