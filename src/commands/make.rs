@@ -28,6 +28,7 @@ pub async fn handle(config_path: &str, cmd: MakeCommands, verbose: bool) -> Resu
             output,
             migration,
             seeder,
+            factory,
             all,
         } => {
             make_model(
@@ -48,6 +49,7 @@ pub async fn handle(config_path: &str, cmd: MakeCommands, verbose: bool) -> Resu
                 &output,
                 migration || all,
                 seeder || all,
+                factory || all,
                 verbose,
             )
             .await
@@ -96,6 +98,7 @@ async fn make_model(
     output: &str,
     create_migration: bool,
     create_seeder: bool,
+    create_factory: bool,
     verbose: bool,
 ) -> Result<(), String> {
     let config = TideConfig::load_or_default(config_path);
@@ -155,6 +158,18 @@ async fn make_model(
         let seeder_name = format!("{}Seeder", name);
         let seeder_path = seeder_gen.generate(&seeder_name, Some(name.to_string()), 10)?;
         print_success(&format!("Created seeder: {}", seeder_path));
+    }
+
+    // Generate factory if requested
+    if create_factory {
+        if verbose {
+            print_info("Generating factory for model...");
+        }
+
+        let factory_gen = FactoryGenerator::new(&config);
+        let factory_name = format!("{}Factory", name);
+        let factory_path = factory_gen.generate(&factory_name, Some(name.to_string()))?;
+        print_success(&format!("Created factory: {}", factory_path));
     }
 
     Ok(())

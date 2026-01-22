@@ -303,11 +303,11 @@ enum MakeCommands {
         nullable: Option<String>,
 
         /// Enable soft deletes
-        #[arg(long)]
+        #[arg(long, alias = "soft-delete")]
         soft_deletes: bool,
 
-        /// Enable timestamps (created_at, updated_at)
-        #[arg(long, default_value = "true")]
+        /// Enable timestamps (created_at, updated_at) - enabled by default, use --no-timestamps to disable
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         timestamps: bool,
 
         /// Enable tokenization
@@ -319,14 +319,18 @@ enum MakeCommands {
         output: String,
 
         /// Also generate a migration for this model
-        #[arg(short, long)]
+        #[arg(long)]
         migration: bool,
 
         /// Also generate a seeder for this model
         #[arg(long)]
         seeder: bool,
 
-        /// Generate all (migration + seeder)
+        /// Also generate a factory for this model
+        #[arg(long)]
+        factory: bool,
+
+        /// Generate all (migration + seeder + factory)
         #[arg(short, long)]
         all: bool,
     },

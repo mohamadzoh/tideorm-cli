@@ -161,16 +161,16 @@ function buildModelCommand() {
     if (table) command += ` --table ${table}`;
     if (fields) command += ` --fields "${fields}"`;
     if (relations) command += ` --relations "${relations}"`;
-    if (indexes) command += ` --indexes "${indexes}"`;
+    if (indexes) command += ` --indexed "${indexes}"`;
     
     if (!document.getElementById('opt-timestamps').checked) {
-        command += ' --no-timestamps';
+        command += ' --timestamps=false';
     }
     if (document.getElementById('opt-soft-delete').checked) {
-        command += ' --soft-delete';
+        command += ' --soft-deletes';
     }
-    if (!document.getElementById('opt-migration').checked) {
-        command += ' --no-migration';
+    if (document.getElementById('opt-migration').checked) {
+        command += ' --migration';
     }
     if (document.getElementById('opt-factory').checked) {
         command += ' --factory';
