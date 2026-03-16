@@ -5,7 +5,7 @@ edition = "2024"
 description = "Command-line interface for TideORM"
 authors = ["Mohamad Al Zohbie"]
 license = "MIT"
-repository = "https://github.com/mohamadzoh/tideorm"
+repository = "https://github.com/mohamadzoh/tideorm-cli"
 keywords = ["orm", "cli", "database", "migration", "rust"]
 categories = ["command-line-utilities", "database"]
 
