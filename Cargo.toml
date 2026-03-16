@@ -59,7 +59,7 @@ console = "0.16.3"
 tiny_http = "0.12"
 
 # Local TideORM runtime for live database access
-tideorm = { path = "../tideorm", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio"] }
+tideorm = {version = "*", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio"] }
 
 [features]
 default = []

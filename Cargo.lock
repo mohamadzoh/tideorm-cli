@@ -2956,7 +2956,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2991,6 +2991,8 @@ dependencies = [
 [[package]]
 name = "tideorm"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d538bf01bdbece6c835e816ebf6f3ebe986560aee760063cf3f01a0888bd8d3a"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -3039,6 +3041,8 @@ dependencies = [
 [[package]]
 name = "tideorm-macros"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "232c11d999d15b527789b1c8633012ed1ea236c0b5303bf4679a8c97c98b5a74"
 dependencies = [
  "convert_case",
  "darling 0.23.0",
