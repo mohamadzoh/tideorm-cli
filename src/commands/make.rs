@@ -5,6 +5,7 @@ use crate::generators::{
     factory::FactoryGenerator, migration::MigrationGenerator,
     model::ModelGenerator, seeder::SeederGenerator,
 };
+use crate::utils::{RelationDefinition, RelationType};
 use crate::utils::{print_info, print_success};
 use crate::MakeCommands;
 
@@ -108,7 +109,13 @@ async fn make_model(
     }
 
     // Clone fields for migration generation
-    let fields_for_migration = fields.clone();
+    let fields_for_migration = prepare_model_migration_fields(
+        fields.clone(),
+        relations.as_deref(),
+        attachments_single.as_deref(),
+        attachments_multi.as_deref(),
+        &config.model.primary_key_type,
+    )?;
 
     // Create model generator
     let generator = ModelGenerator::new(&config)
@@ -144,6 +151,8 @@ async fn make_model(
             Some(crate::utils::pluralize(&crate::utils::to_snake_case(name))),
             None,
             fields_for_migration,
+            timestamps,
+            soft_deletes,
         )?;
         print_success(&format!("Created migration: {}", migration_path));
     }
@@ -192,7 +201,7 @@ async fn make_migration(
     }
 
     let generator = MigrationGenerator::new(&config);
-    let path = generator.generate(name, create, table, fields)?;
+    let path = generator.generate(name, create, table, fields, false, false)?;
 
     print_success(&format!("Created migration: {}", path));
 
@@ -242,4 +251,91 @@ async fn make_factory(
     print_success(&format!("Created factory: {}", path));
 
     Ok(())
+}
+
+fn prepare_model_migration_fields(
+    fields: Option<String>,
+    relations: Option<&str>,
+    attachments_single: Option<&str>,
+    attachments_multi: Option<&str>,
+    primary_key_type: &str,
+) -> Result<Option<String>, String> {
+    let mut field_defs: Vec<String> = fields
+        .as_deref()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(relations_str) = relations {
+        for relation in relations_str.split(',').map(str::trim).filter(|relation| !relation.is_empty()) {
+            let relation = RelationDefinition::parse(relation)?;
+            if relation.relation_type != RelationType::BelongsTo {
+                continue;
+            }
+
+            let foreign_key = relation.foreign_key.unwrap_or_else(|| {
+                format!(
+                    "{}_id",
+                    crate::utils::to_snake_case(&relation.related_model)
+                )
+            });
+
+            let already_present = field_defs.iter().any(|field| {
+                field
+                    .split(':')
+                    .next()
+                    .is_some_and(|name| name.trim() == foreign_key)
+            });
+
+            if !already_present {
+                field_defs.push(format!("{}:{}:indexed", foreign_key, primary_key_type));
+            }
+        }
+    }
+
+    if attachments_single.is_some() || attachments_multi.is_some() {
+        let has_files_column = field_defs.iter().any(|field| {
+            field
+                .split(':')
+                .next()
+                .is_some_and(|name| name.trim() == "files")
+        });
+
+        if !has_files_column {
+            field_defs.push("files:jsonb:nullable".to_string());
+        }
+    }
+
+    if field_defs.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(field_defs.join(",")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_model_migration_fields;
+
+    #[test]
+    fn test_prepare_model_migration_fields_uses_configured_primary_key_type() {
+        let fields = prepare_model_migration_fields(
+            Some("title:string".to_string()),
+            Some("author:belongs_to:User"),
+            None,
+            None,
+            "uuid",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(fields.contains("title:string"));
+        assert!(fields.contains("user_id:uuid:indexed"));
+    }
 }

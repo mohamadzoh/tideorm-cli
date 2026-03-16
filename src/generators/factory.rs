@@ -62,7 +62,6 @@ impl {factory_name} {{
     /// Create a new {model_pascal} with default values
     pub fn definition() -> {model_pascal} {{
         {model_pascal} {{
-            id: 0,
             // TODO: Add default field values
             // Example:
             // name: Self::fake_name(),
@@ -175,8 +174,7 @@ mod tests {{
 
     #[test]
     fn test_make() {{
-        let {model_snake} = {factory_name}::make();
-        assert_eq!({model_snake}.id, 0);
+        let _{model_snake} = {factory_name}::make();
     }}
 
     #[test]
@@ -187,11 +185,7 @@ mod tests {{
 
     #[test]
     fn test_with_modifier() {{
-        let {model_snake} = {factory_name}::with(|r| {{
-            // Modify the record
-            r.id = 999;
-        }});
-        assert_eq!({model_snake}.id, 999);
+        let _{model_snake} = {factory_name}::with(|_r| {{}});
     }}
 }}
 "#,

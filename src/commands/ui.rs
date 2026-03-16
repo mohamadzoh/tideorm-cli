@@ -4,9 +4,22 @@
 //! with a query playground and model generator.
 
 use colored::Colorize;
+use crate::{config::TideConfig, runtime_db};
+use serde::Deserialize;
+use serde_json::json;
 use std::io::Cursor;
 use std::path::Path;
 use tiny_http::{Header, Method, Response, Server};
+
+#[derive(Deserialize)]
+struct ExecuteRequest {
+    command: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct QueryRequest {
+    query: String,
+}
 
 /// Embedded static files from src/ui/
 const HTML_CONTENT: &str = include_str!("../ui/index.html");
@@ -92,10 +105,9 @@ pub async fn run(host: &str, port: u16, verbose: bool) -> Result<(), String> {
             }
         };
         
-        if let Err(e) = request.respond(response) {
-            if verbose {
-                eprintln!("  {} Failed to send response: {}", "Error:".red(), e);
-            }
+        if let Err(e) = request.respond(response)
+            && verbose {
+            eprintln!("  {} Failed to send response: {}", "Error:".red(), e);
         }
     }
     
@@ -119,6 +131,10 @@ fn create_response(content: &str, content_type: &str) -> Response<Cursor<Vec<u8>
         )
 }
 
+fn create_json_response(value: serde_json::Value) -> Response<Cursor<Vec<u8>>> {
+    create_response(&value.to_string(), "application/json")
+}
+
 /// Handle CLI command execution requests
 fn handle_execute_request(
     request: &mut tiny_http::Request,
@@ -126,65 +142,80 @@ fn handle_execute_request(
 ) -> Response<Cursor<Vec<u8>>> {
     // Check if tideorm.toml exists
     if !Path::new("tideorm.toml").exists() {
-        return create_response(
-            r#"{"success": false, "error": "No tideorm.toml found. Run 'tideorm init' first."}"#,
-            "application/json"
-        );
+        return create_json_response(json!({
+            "success": false,
+            "error": "No tideorm.toml found. Run 'tideorm init' first.",
+        }));
     }
     
     // Read the request body
     let mut body = String::new();
     if let Err(e) = std::io::Read::read_to_string(&mut request.as_reader(), &mut body) {
-        return create_response(
-            &format!(r#"{{"success": false, "error": "Failed to read request: {}"}}"#, e),
-            "application/json"
-        );
+        return create_json_response(json!({
+            "success": false,
+            "error": format!("Failed to read request: {}", e),
+        }));
     }
-    
-    // Parse the command from JSON
-    let command = extract_json_field(&body, "command");
-    
-    if command.is_empty() {
-        return create_response(
-            r#"{"success": false, "error": "No command provided"}"#,
-            "application/json"
-        );
+
+    let payload: ExecuteRequest = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return create_json_response(json!({
+                "success": false,
+                "error": format!("Invalid request payload: {}", error),
+            }));
+        }
+    };
+
+    if payload.command.is_empty() {
+        return create_json_response(json!({
+            "success": false,
+            "error": "No command provided",
+        }));
     }
-    
+
+    let command_display = payload.command.join(" ");
+
     if verbose {
-        println!("  {} Executing: tideorm {}", "→".cyan(), command.yellow());
+        println!("  {} Executing: tideorm {}", "→".cyan(), command_display.yellow());
     }
-    
-    // Execute the tideorm command
-    let output = std::process::Command::new("tideorm")
-        .args(command.split_whitespace())
+
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return create_json_response(json!({
+                "success": false,
+                "error": format!("Failed to resolve CLI executable: {}", error),
+            }));
+        }
+    };
+
+    let output = std::process::Command::new(executable)
+        .args(&payload.command)
         .output();
-    
+
     match output {
         Ok(result) => {
             let stdout = String::from_utf8_lossy(&result.stdout);
             let stderr = String::from_utf8_lossy(&result.stderr);
             let success = result.status.success();
-            
+
             let output_text = if stdout.is_empty() {
                 stderr.to_string()
             } else {
                 format!("{}{}", stdout, if stderr.is_empty() { "".to_string() } else { format!("\n{}", stderr) })
             };
-            
-            // Escape the output for JSON
-            let escaped = escape_json_string(&output_text);
-            
-            create_response(
-                &format!(r#"{{"success": {}, "output": "{}"}}"#, success, escaped),
-                "application/json"
-            )
+
+            create_json_response(json!({
+                "success": success,
+                "output": output_text,
+            }))
         }
         Err(e) => {
-            create_response(
-                &format!(r#"{{"success": false, "error": "Failed to execute command: {}"}}"#, e),
-                "application/json"
-            )
+            create_json_response(json!({
+                "success": false,
+                "error": format!("Failed to execute command: {}", e),
+            }))
         }
     }
 }
@@ -194,68 +225,73 @@ fn handle_query_request(
     request: &mut tiny_http::Request,
     verbose: bool
 ) -> Response<Cursor<Vec<u8>>> {
+    if !Path::new("tideorm.toml").exists() {
+        return create_json_response(json!({
+            "success": false,
+            "error": "No tideorm.toml found. Run 'tideorm init' first.",
+        }));
+    }
+
     // Read the request body
     let mut body = String::new();
     if let Err(e) = std::io::Read::read_to_string(&mut request.as_reader(), &mut body) {
-        return create_response(
-            &format!(r#"{{"success": false, "error": "Failed to read request: {}"}}"#, e),
-            "application/json"
-        );
+        return create_json_response(json!({
+            "success": false,
+            "error": format!("Failed to read request: {}", e),
+        }));
     }
-    
-    // Parse the query from JSON
-    let query = extract_json_field(&body, "query");
-    
-    if query.is_empty() {
-        return create_response(
-            r#"{"success": false, "error": "No query provided"}"#,
-            "application/json"
-        );
-    }
-    
-    if verbose {
-        println!("  {} Executing query: {}", "→".cyan(), query.yellow());
-    }
-    
-    // For now, we'll simulate query execution
-    // In a full implementation, this would connect to the actual database
-    let result = format!(
-        "Query received: {}\n\nNote: Direct SQL execution requires database connection configuration.\nUse 'tideorm db' commands for database operations.",
-        query
-    );
-    
-    let escaped = escape_json_string(&result);
-    
-    create_response(
-        &format!(r#"{{"success": true, "result": "{}"}}"#, escaped),
-        "application/json"
-    )
-}
 
-/// Simple JSON field extractor (avoids adding serde dependency just for this)
-fn extract_json_field(json: &str, field: &str) -> String {
-    let pattern = format!(r#""{}""#, field);
-    if let Some(start) = json.find(&pattern) {
-        let rest = &json[start + pattern.len()..];
-        // Skip : and whitespace
-        let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-        
-        if rest.starts_with('"') {
-            // String value
-            let rest = &rest[1..];
-            if let Some(end) = rest.find('"') {
-                return rest[..end].to_string();
-            }
+    let payload: QueryRequest = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return create_json_response(json!({
+                "success": false,
+                "error": format!("Invalid request payload: {}", error),
+            }));
         }
-    }
-    String::new()
-}
+    };
 
-/// Escape a string for JSON embedding
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    if payload.query.trim().is_empty() {
+        return create_json_response(json!({
+            "success": false,
+            "error": "No query provided",
+        }));
+    }
+
+    if verbose {
+        println!("  {} Executing query: {}", "→".cyan(), payload.query.yellow());
+    }
+
+    let config = match TideConfig::load("tideorm.toml") {
+        Ok(config) => config,
+        Err(error) => {
+            return create_json_response(json!({
+                "success": false,
+                "error": error,
+            }));
+        }
+    };
+
+    let outcome = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            if runtime_db::formats_result_set(&payload.query) {
+                let rows = runtime_db::query_json(&config, &payload.query).await?;
+                serde_json::to_string_pretty(&rows).map_err(|error| error.to_string())
+            } else {
+                let affected = runtime_db::execute(&config, &payload.query).await?;
+                Ok(format!("Query executed successfully.\nRows affected: {}", affected))
+            }
+        })
+    });
+
+    match outcome {
+        Ok(result) => create_json_response(json!({
+            "success": true,
+            "result": result,
+        })),
+        Err(error) => create_json_response(json!({
+            "success": false,
+            "error": error,
+        })),
+    }
 }

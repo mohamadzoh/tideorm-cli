@@ -91,9 +91,10 @@ async function runCommand(command, displayName) {
     
     const outputId = getOutputIdForCommand(command);
     const outputEl = document.getElementById(outputId);
+    const commandText = formatCommand(command);
     
     if (outputEl) {
-        outputEl.textContent = `Executing: tideorm ${command}\n\nPlease wait...`;
+        outputEl.textContent = `Executing: tideorm ${commandText}\n\nPlease wait...`;
     }
     
     try {
@@ -124,16 +125,31 @@ async function runCommand(command, displayName) {
 
 // Get the appropriate output element ID based on command
 function getOutputIdForCommand(command) {
-    if (command.startsWith('make') || command.includes('generate')) {
+    const commandText = Array.isArray(command) ? command.join(' ') : command;
+
+    if (commandText.startsWith('make') || commandText.includes('generate')) {
         return 'generator-output';
-    } else if (command.startsWith('migrate')) {
+    } else if (commandText.startsWith('migrate')) {
         return 'migration-output';
-    } else if (command.startsWith('db seed') || command.includes('seeder')) {
+    } else if (commandText.startsWith('db seed') || commandText.includes('seeder')) {
         return 'seeder-output';
-    } else if (command.startsWith('db')) {
+    } else if (commandText.startsWith('db')) {
         return 'database-output';
     }
     return 'generator-output';
+}
+
+function formatCommand(command) {
+    const args = Array.isArray(command) ? command : [command];
+    return args.map(formatCommandArg).join(' ');
+}
+
+function formatCommandArg(arg) {
+    if (/^[A-Za-z0-9_./:=:-]+$/.test(arg)) {
+        return arg;
+    }
+
+    return `"${arg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 // Model generation
@@ -156,27 +172,27 @@ function buildModelCommand() {
     const relations = document.getElementById('relations').value;
     const indexes = document.getElementById('indexes').value;
     
-    let command = `make model ${name}`;
+    const command = ['make', 'model', name];
     
-    if (table) command += ` --table ${table}`;
-    if (fields) command += ` --fields "${fields}"`;
-    if (relations) command += ` --relations "${relations}"`;
-    if (indexes) command += ` --indexed "${indexes}"`;
+    if (table) command.push('--table', table);
+    if (fields) command.push('--fields', fields);
+    if (relations) command.push('--relations', relations);
+    if (indexes) command.push('--indexed', indexes);
     
     if (!document.getElementById('opt-timestamps').checked) {
-        command += ' --timestamps=false';
+        command.push('--timestamps=false');
     }
     if (document.getElementById('opt-soft-delete').checked) {
-        command += ' --soft-deletes';
+        command.push('--soft-deletes');
     }
     if (document.getElementById('opt-migration').checked) {
-        command += ' --migration';
+        command.push('--migration');
     }
     if (document.getElementById('opt-factory').checked) {
-        command += ' --factory';
+        command.push('--factory');
     }
     if (document.getElementById('opt-seeder').checked) {
-        command += ' --seeder';
+        command.push('--seeder');
     }
     
     return command;
@@ -191,7 +207,7 @@ function previewCommand() {
     
     const command = buildModelCommand();
     const outputEl = document.getElementById('generator-output');
-    outputEl.textContent = `Preview command:\n\ntideorm ${command}\n\n(Click "Generate Model" to execute)`;
+    outputEl.textContent = `Preview command:\n\ntideorm ${formatCommand(command)}\n\n(Click "Generate Model" to execute)`;
 }
 
 // Other generators
@@ -201,7 +217,7 @@ function generateMigration() {
         showToast('warning', 'Name Required', 'Please enter a migration name.');
         return;
     }
-    runCommand(`make migration ${name}`, 'Migration creation');
+    runCommand(['make', 'migration', name], 'Migration creation');
 }
 
 function generateSeeder() {
@@ -210,7 +226,7 @@ function generateSeeder() {
         showToast('warning', 'Name Required', 'Please enter a seeder name.');
         return;
     }
-    runCommand(`make seeder ${name}`, 'Seeder creation');
+    runCommand(['make', 'seeder', name], 'Seeder creation');
 }
 
 function generateFactory() {
@@ -219,7 +235,7 @@ function generateFactory() {
         showToast('warning', 'Name Required', 'Please enter a factory name.');
         return;
     }
-    runCommand(`make factory ${name}`, 'Factory creation');
+    runCommand(['make', 'factory', name], 'Factory creation');
 }
 
 function runSpecificSeeder() {
@@ -228,7 +244,7 @@ function runSpecificSeeder() {
         showToast('warning', 'Name Required', 'Please enter a seeder name.');
         return;
     }
-    runCommand(`db seed --class ${name}`, `Running ${name}`);
+    runCommand(['db', 'seed', '--seeder', name], `Running ${name}`);
 }
 
 // Query playground
@@ -351,7 +367,7 @@ function confirmModalAction() {
     closeModal();
     
     if (type === 'command') {
-        runCommand(action, action);
+        runCommand(action, formatCommand(action));
     } else if (type === 'query') {
         executeQueryDirect(action);
     }

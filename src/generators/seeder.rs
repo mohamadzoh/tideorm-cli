@@ -61,16 +61,20 @@ use tideorm::prelude::*;
 use crate::models::{model_pascal};
 
 /// {} seeder
+#[derive(Default)]
 pub struct {seeder_name};
 
-impl {seeder_name} {{
-    /// Run the seeder
-    pub async fn run() -> tideorm::Result<()> {{
+#[async_trait]
+impl Seed for {seeder_name} {{
+    fn name(&self) -> &str {{
+        "{model_snake}_seeder"
+    }}
+
+    async fn run(&self, _db: &Database) -> tideorm::Result<()> {{
         println!("Seeding {model_snake}s...");
 
         for i in 1..={count} {{
             let {model_snake} = {model_pascal} {{
-                id: 0, // Will be auto-generated
                 // TODO: Fill in the model fields
                 // Example:
                 // name: format!("{model_pascal} {{}}", i),
@@ -84,7 +88,9 @@ impl {seeder_name} {{
         println!("Seeded {count} {model_snake}(s)");
         Ok(())
     }}
+}}
 
+impl {seeder_name} {{
     /// Run the seeder with a factory
     pub async fn run_with_factory() -> tideorm::Result<()> {{
         println!("Seeding {model_snake}s with factory...");
@@ -93,7 +99,7 @@ impl {seeder_name} {{
         // Example:
         // {model_pascal}Factory::create_many({count}).await?;
 
-        Self::run().await
+        Self::default().run(&db()).await
     }}
 }}
 
@@ -129,18 +135,22 @@ mod tests {{
 use tideorm::prelude::*;
 
 /// {}
+#[derive(Default)]
 pub struct {};
 
-impl {} {{
-    /// Run the seeder
-    pub async fn run() -> tideorm::Result<()> {{
+#[async_trait]
+impl Seed for {} {{
+    fn name(&self) -> &str {{
+        "{}"
+    }}
+
+    async fn run(&self, _db: &Database) -> tideorm::Result<()> {{
         println!("Running {}...");
 
         // TODO: Add your seeding logic here
         // Example:
         // 
         // let user = User {{
-        //     id: 0,
         //     name: "Admin".to_string(),
         //     email: "admin@example.com".to_string(),
         //     ..Default::default()
@@ -164,7 +174,13 @@ mod tests {{
     }}
 }}
 "#,
-            seeder_name, seeder_name, seeder_name, seeder_name, seeder_name, seeder_name
+            seeder_name,
+            seeder_name,
+            seeder_name,
+            seeder_name,
+            to_snake_case(seeder_name),
+            seeder_name,
+            seeder_name
         )
     }
 

@@ -1,6 +1,7 @@
 //! Schema command for TideORM CLI
 
 use crate::config::TideConfig;
+use crate::runtime_db;
 use crate::utils::print_info;
 use colored::Colorize;
 
@@ -93,7 +94,7 @@ async fn show_all_schemas(config: &TideConfig) -> Result<(), String> {
     for table in &tables {
         let columns = get_table_schema(config, table).await?;
         
-        println!("\n{}", format!("  {} ({})", table.green().bold(), columns.len()));
+        println!("\n  {} ({})", table.green().bold(), columns.len());
         
         for col in &columns {
             let key_marker = match col.key.as_deref() {
@@ -152,164 +153,58 @@ struct ForeignKeyInfo {
     references_column: String,
 }
 
-// =============================================================================
-// DATABASE QUERIES (to be implemented with actual database connection)
-// =============================================================================
-
 /// Get all tables from the database
-async fn get_all_tables(_config: &TideConfig) -> Result<Vec<String>, String> {
-    // TODO: Actually query the database
-    // For now, return mock data
-    Ok(vec![
-        "users".to_string(),
-        "posts".to_string(),
-        "comments".to_string(),
-        "_tideorm_migrations".to_string(),
-    ])
+async fn get_all_tables(config: &TideConfig) -> Result<Vec<String>, String> {
+    runtime_db::list_tables(config).await
 }
 
 /// Get schema for a table
-async fn get_table_schema(_config: &TideConfig, table_name: &str) -> Result<Vec<ColumnSchema>, String> {
-    // TODO: Actually query the database schema
-    // For now, return mock data based on common patterns
-    
-    let mock_columns = match table_name {
-        "users" => vec![
-            ColumnSchema {
-                name: "id".to_string(),
-                data_type: "BIGINT".to_string(),
-                nullable: false,
-                key: Some("PRI".to_string()),
-                default: None,
-                extra: Some("auto_increment".to_string()),
-            },
-            ColumnSchema {
-                name: "name".to_string(),
-                data_type: "VARCHAR(255)".to_string(),
-                nullable: false,
-                key: None,
-                default: None,
-                extra: None,
-            },
-            ColumnSchema {
-                name: "email".to_string(),
-                data_type: "VARCHAR(255)".to_string(),
-                nullable: false,
-                key: Some("UNI".to_string()),
-                default: None,
-                extra: None,
-            },
-            ColumnSchema {
-                name: "created_at".to_string(),
-                data_type: "TIMESTAMPTZ".to_string(),
-                nullable: false,
-                key: None,
-                default: Some("NOW()".to_string()),
-                extra: None,
-            },
-            ColumnSchema {
-                name: "updated_at".to_string(),
-                data_type: "TIMESTAMPTZ".to_string(),
-                nullable: false,
-                key: None,
-                default: Some("NOW()".to_string()),
-                extra: None,
-            },
-        ],
-        "posts" => vec![
-            ColumnSchema {
-                name: "id".to_string(),
-                data_type: "BIGINT".to_string(),
-                nullable: false,
-                key: Some("PRI".to_string()),
-                default: None,
-                extra: Some("auto_increment".to_string()),
-            },
-            ColumnSchema {
-                name: "user_id".to_string(),
-                data_type: "BIGINT".to_string(),
-                nullable: false,
-                key: Some("FK".to_string()),
-                default: None,
-                extra: None,
-            },
-            ColumnSchema {
-                name: "title".to_string(),
-                data_type: "VARCHAR(255)".to_string(),
-                nullable: false,
-                key: None,
-                default: None,
-                extra: None,
-            },
-            ColumnSchema {
-                name: "content".to_string(),
-                data_type: "TEXT".to_string(),
-                nullable: true,
-                key: None,
-                default: None,
-                extra: None,
-            },
-            ColumnSchema {
-                name: "created_at".to_string(),
-                data_type: "TIMESTAMPTZ".to_string(),
-                nullable: false,
-                key: None,
-                default: Some("NOW()".to_string()),
-                extra: None,
-            },
-        ],
-        _ => vec![
-            ColumnSchema {
-                name: "id".to_string(),
-                data_type: "BIGINT".to_string(),
-                nullable: false,
-                key: Some("PRI".to_string()),
-                default: None,
-                extra: Some("auto_increment".to_string()),
-            },
-        ],
-    };
-
-    Ok(mock_columns)
+async fn get_table_schema(config: &TideConfig, table_name: &str) -> Result<Vec<ColumnSchema>, String> {
+    runtime_db::table_columns(config, table_name)
+        .await
+        .map(|columns| {
+            columns
+                .into_iter()
+                .map(|column| ColumnSchema {
+                    name: column.name,
+                    data_type: column.data_type,
+                    nullable: column.nullable,
+                    key: column.key,
+                    default: column.default,
+                    extra: column.extra,
+                })
+                .collect()
+        })
 }
 
 /// Get indexes for a table
-async fn get_table_indexes(_config: &TideConfig, table_name: &str) -> Result<Vec<IndexInfo>, String> {
-    // TODO: Actually query the database
-    // For now, return mock data
-    
-    let mock_indexes = match table_name {
-        "users" => vec![
-            IndexInfo {
-                name: "users_pkey".to_string(),
-                columns: vec!["id".to_string()],
-                unique: true,
-            },
-            IndexInfo {
-                name: "users_email_unique".to_string(),
-                columns: vec!["email".to_string()],
-                unique: true,
-            },
-        ],
-        _ => vec![],
-    };
-
-    Ok(mock_indexes)
+async fn get_table_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<IndexInfo>, String> {
+    runtime_db::table_indexes(config, table_name)
+        .await
+        .map(|indexes| {
+            indexes
+                .into_iter()
+                .map(|index| IndexInfo {
+                    name: index.name,
+                    columns: index.columns,
+                    unique: index.unique,
+                })
+                .collect()
+        })
 }
 
 /// Get foreign keys for a table
-async fn get_foreign_keys(_config: &TideConfig, table_name: &str) -> Result<Vec<ForeignKeyInfo>, String> {
-    // TODO: Actually query the database
-    // For now, return mock data
-    
-    let mock_fks = match table_name {
-        "posts" => vec![ForeignKeyInfo {
-            column: "user_id".to_string(),
-            references_table: "users".to_string(),
-            references_column: "id".to_string(),
-        }],
-        _ => vec![],
-    };
-
-    Ok(mock_fks)
+async fn get_foreign_keys(config: &TideConfig, table_name: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+    runtime_db::table_foreign_keys(config, table_name)
+        .await
+        .map(|foreign_keys| {
+            foreign_keys
+                .into_iter()
+                .map(|foreign_key| ForeignKeyInfo {
+                    column: foreign_key.column,
+                    references_table: foreign_key.references_table,
+                    references_column: foreign_key.references_column,
+                })
+                .collect()
+        })
 }

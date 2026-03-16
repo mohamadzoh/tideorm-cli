@@ -163,7 +163,7 @@ async fn generate_migration(
     }
 
     let generator = MigrationGenerator::new(&config);
-    let output_path = generator.generate(name, create, table, fields)?;
+    let output_path = generator.generate(name, create, table, fields, false, false)?;
 
     print_success(&format!("Created migration: {}", output_path));
 
@@ -309,11 +309,10 @@ async fn migrate_fresh(
     }
 
     // Confirm in production
-    if config.is_production() {
-        if !utils::confirm("Are you sure you want to drop all tables in PRODUCTION?") {
-            print_info("Operation cancelled");
-            return Ok(());
-        }
+    if config.is_production()
+        && !utils::confirm("Are you sure you want to drop all tables in PRODUCTION?") {
+        print_info("Operation cancelled");
+        return Ok(());
     }
 
     print_info("Dropping all tables...");
@@ -526,7 +525,7 @@ fn get_all_migrations(migrations_path: &str) -> Result<Vec<Migration>, String> {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let file_path = entry.path();
 
-        if file_path.extension().map_or(false, |ext| ext == "rs") {
+        if file_path.extension().is_some_and(|ext| ext == "rs") {
             let name = file_path
                 .file_stem()
                 .and_then(|s| s.to_str())

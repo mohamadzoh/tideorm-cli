@@ -69,6 +69,8 @@ pub struct FieldDefinition {
     pub nullable: bool,
     pub unique: bool,
     pub indexed: bool,
+    pub primary_key: bool,
+    pub auto_increment: bool,
     pub default: Option<String>,
 }
 
@@ -88,6 +90,8 @@ impl FieldDefinition {
         let mut nullable = false;
         let mut unique = false;
         let mut indexed = false;
+        let mut primary_key = false;
+        let mut auto_increment = false;
         let mut default = None;
 
         // Parse modifiers
@@ -97,6 +101,8 @@ impl FieldDefinition {
                 "nullable" | "null" => nullable = true,
                 "unique" | "uniq" => unique = true,
                 "indexed" | "index" | "idx" => indexed = true,
+                "primary_key" | "primary" | "pk" => primary_key = true,
+                "auto_increment" | "autoincrement" | "increment" => auto_increment = true,
                 _ if part.starts_with("default=") => {
                     default = Some(part.strip_prefix("default=").unwrap().to_string());
                 }
@@ -112,6 +118,8 @@ impl FieldDefinition {
             nullable,
             unique,
             indexed,
+            primary_key,
+            auto_increment,
             default,
         })
     }
@@ -131,9 +139,16 @@ impl FieldDefinition {
             "date" => "chrono::NaiveDate",
             "time" => "chrono::NaiveTime",
             "uuid" => "uuid::Uuid",
-            "json" | "jsonb" => "serde_json::Value",
+            "json" => "Json",
+            "jsonb" => "Jsonb",
             "decimal" => "rust_decimal::Decimal",
             "bytes" | "blob" | "binary" => "Vec<u8>",
+            "int_array" | "integer_array" => "IntArray",
+            "bigint_array" => "BigIntArray",
+            "text_array" | "string_array" => "TextArray",
+            "bool_array" | "boolean_array" => "BoolArray",
+            "float_array" => "FloatArray",
+            "json_array" => "JsonArray",
             _ => &self.field_type,
         };
 
@@ -170,6 +185,24 @@ impl FieldDefinition {
             ("decimal", _) => "DECIMAL(19, 4)".to_string(),
             ("bytes" | "blob" | "binary", "postgres") => "BYTEA".to_string(),
             ("bytes" | "blob" | "binary", _) => "BLOB".to_string(),
+            ("int_array" | "integer_array", "postgres") => "INTEGER[]".to_string(),
+            ("bigint_array", "postgres") => "BIGINT[]".to_string(),
+            ("text_array" | "string_array", "postgres") => "TEXT[]".to_string(),
+            ("bool_array" | "boolean_array", "postgres") => "BOOLEAN[]".to_string(),
+            ("float_array", "postgres") => "DOUBLE PRECISION[]".to_string(),
+            ("json_array", "postgres") => "JSONB[]".to_string(),
+            (
+                "int_array"
+                | "integer_array"
+                | "bigint_array"
+                | "text_array"
+                | "string_array"
+                | "bool_array"
+                | "boolean_array"
+                | "float_array"
+                | "json_array",
+                _,
+            ) => "TEXT".to_string(),
             _ => self.field_type.to_uppercase(),
         }
     }
@@ -269,6 +302,10 @@ mod tests {
         let field = FieldDefinition::parse("email:string:unique:indexed").unwrap();
         assert!(field.unique);
         assert!(field.indexed);
+
+        let field = FieldDefinition::parse("id:i64:primary_key:auto_increment").unwrap();
+        assert!(field.primary_key);
+        assert!(field.auto_increment);
     }
 
     #[test]

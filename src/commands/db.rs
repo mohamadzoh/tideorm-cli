@@ -1,6 +1,7 @@
 //! Database commands for TideORM CLI
 
 use crate::config::TideConfig;
+use crate::runtime_db;
 use crate::utils::{print_info, print_success, print_warning};
 use crate::DbCommands;
 use colored::Colorize;
@@ -200,14 +201,13 @@ async fn drop_database(
         .or(config.database.database.as_deref())
         .ok_or("Database name not specified")?;
 
-    if !force {
-        if !crate::utils::confirm(&format!(
-            "Are you sure you want to drop database '{}'?",
+    if !force
+        && !crate::utils::confirm(&format!(
+            "Are you sure you want to drop database '{}' ?",
             db_name
         )) {
-            print_info("Operation cancelled");
-            return Ok(());
-        }
+        print_info("Operation cancelled");
+        return Ok(());
     }
 
     if verbose {
@@ -235,11 +235,9 @@ async fn wipe(
         return Err("Cannot wipe database in production without --force flag".to_string());
     }
 
-    if !force {
-        if !crate::utils::confirm("Are you sure you want to wipe all tables?") {
-            print_info("Operation cancelled");
-            return Ok(());
-        }
+    if !force && !crate::utils::confirm("Are you sure you want to wipe all tables?") {
+        print_info("Operation cancelled");
+        return Ok(());
     }
 
     if verbose {
@@ -351,7 +349,7 @@ fn get_all_seeders(seeders_path: &str) -> Result<Vec<Seeder>, String> {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let file_path = entry.path();
 
-        if file_path.extension().map_or(false, |ext| ext == "rs") {
+        if file_path.extension().is_some_and(|ext| ext == "rs") {
             let name = file_path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -386,71 +384,51 @@ fn find_seeder(seeders_path: &str, name: &str) -> Result<Seeder, String> {
 
 /// Run a seeder
 async fn run_seeder(_config: &TideConfig, _seeder: &Seeder) -> Result<u32, String> {
-    // TODO: Actually run the seeder
-    // This would require dynamic loading or compiling the seeder
-    // For now, simulate success
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    Ok(10) // Simulated count
+    Err(
+        "Running Rust seeders requires an application-side seeder runner; the CLI cannot load project seeder modules directly yet."
+            .to_string(),
+    )
 }
 
 /// Test database connection
-async fn test_connection(_config: &TideConfig) -> Result<(), String> {
-    // TODO: Actually test the connection
-    // For now, simulate success
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    Ok(())
+async fn test_connection(config: &TideConfig) -> Result<(), String> {
+    runtime_db::ping(config).await
 }
 
 /// Create a database
-async fn create_db(_config: &TideConfig, _name: &str) -> Result<(), String> {
-    // TODO: Actually create the database
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    Ok(())
+async fn create_db(config: &TideConfig, name: &str) -> Result<(), String> {
+    runtime_db::create_database(config, name).await
 }
 
 /// Drop a database
-async fn drop_db(_config: &TideConfig, _name: &str) -> Result<(), String> {
-    // TODO: Actually drop the database
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    Ok(())
+async fn drop_db(config: &TideConfig, name: &str) -> Result<(), String> {
+    runtime_db::drop_database(config, name).await
 }
 
 /// Wipe all tables
-async fn wipe_tables(_config: &TideConfig, _drop_types: bool) -> Result<(), String> {
-    // TODO: Actually truncate all tables
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    Ok(())
+async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), String> {
+    runtime_db::wipe_tables(config, drop_types).await
 }
 
 /// Get table columns
-async fn get_table_columns(_config: &TideConfig, _table_name: &str) -> Result<Vec<ColumnInfo>, String> {
-    // TODO: Actually query table schema
-    // For now, return mock data
-    Ok(vec![
-        ColumnInfo {
-            name: "id".to_string(),
-            data_type: "BIGINT".to_string(),
-            nullable: false,
-            key: Some("PRI".to_string()),
-            default: None,
-        },
-        ColumnInfo {
-            name: "created_at".to_string(),
-            data_type: "TIMESTAMPTZ".to_string(),
-            nullable: false,
-            key: None,
-            default: Some("NOW()".to_string()),
-        },
-    ])
+async fn get_table_columns(config: &TideConfig, table_name: &str) -> Result<Vec<ColumnInfo>, String> {
+    runtime_db::table_columns(config, table_name)
+        .await
+        .map(|columns| {
+            columns
+                .into_iter()
+                .map(|column| ColumnInfo {
+                    name: column.name,
+                    data_type: column.data_type,
+                    nullable: column.nullable,
+                    key: column.key,
+                    default: column.default,
+                })
+                .collect()
+        })
 }
 
 /// Get all tables
-async fn get_all_tables(_config: &TideConfig) -> Result<Vec<String>, String> {
-    // TODO: Actually query table list
-    // For now, return mock data
-    Ok(vec![
-        "users".to_string(),
-        "posts".to_string(),
-        "_tideorm_migrations".to_string(),
-    ])
+async fn get_all_tables(config: &TideConfig) -> Result<Vec<String>, String> {
+    runtime_db::list_tables(config).await
 }

@@ -77,6 +77,25 @@ pub async fn run(name: &str, database: &str, verbose: bool) -> Result<(), String
 
     print_success("Created directory structure");
 
+    // Create Cargo.toml if it doesn't exist so `tideorm init` produces a runnable Rust project
+    let cargo_toml_path = "Cargo.toml";
+    if !file_exists(cargo_toml_path) {
+        let package_name = infer_package_name(&project_path);
+        let cargo_toml_content = generate_cargo_toml(&package_name, database);
+        std::fs::write(cargo_toml_path, cargo_toml_content)
+            .map_err(|e| format!("Failed to create Cargo.toml: {}", e))?;
+        print_success("Created Cargo.toml");
+    }
+
+    // Create main.rs if it doesn't exist
+    let main_rs_path = "src/main.rs";
+    if !file_exists(main_rs_path) {
+        let main_rs_content = generate_main_rs();
+        std::fs::write(main_rs_path, main_rs_content)
+            .map_err(|e| format!("Failed to create src/main.rs: {}", e))?;
+        print_success("Created src/main.rs");
+    }
+
     // Create config.rs if it doesn't exist
     let config_rs_path = "src/config.rs";
     if !file_exists(config_rs_path) {
@@ -125,28 +144,34 @@ fn generate_config_rs(database: &str) -> String {
     // SQLite setup
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://database.db".to_string());
-    
-    TideConfig::new()
-        .database_url(&database_url)
-        .pool_size(5)
+
+    TideConfig::init()
+        .database_type(DatabaseType::SQLite)
+        .database(&database_url)
+        .max_connections(5)
+        .min_connections(1)
 "#,
         "mysql" => r#"
     // MySQL setup
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
-    
-    TideConfig::new()
-        .database_url(&database_url)
-        .pool_size(10)
+
+    TideConfig::init()
+        .database_type(DatabaseType::MySQL)
+        .database(&database_url)
+        .max_connections(10)
+        .min_connections(2)
 "#,
         _ => r#"
     // PostgreSQL setup
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
-    
-    TideConfig::new()
-        .database_url(&database_url)
-        .pool_size(10)
+
+    TideConfig::init()
+        .database_type(DatabaseType::Postgres)
+        .database(&database_url)
+        .max_connections(10)
+        .min_connections(2)
 "#,
     };
 
@@ -158,38 +183,36 @@ fn generate_config_rs(database: &str) -> String {
 
 use tideorm::prelude::*;
 
-/// Initialize TideORM configuration
+/// Build the TideORM configuration
 ///
-/// Call this function at application startup to configure the database connection.
+/// Call this function if you want to register more options before connecting.
 ///
 /// # Example
 ///
 /// ```rust
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-///     // Load environment variables
-///     dotenv::dotenv().ok();
-///     
-///     // Initialize TideORM
-///     let config = crate::config::init_tideorm();
-///     tideorm::init(config).await?;
+///     crate::config::connect_tideorm().await?;
 ///     
 ///     // Your application code here...
 ///     
 ///     Ok(())
 /// }}
 /// ```
-pub fn init_tideorm() -> TideConfig {{{db_setup}
-        .build()
+pub fn tideorm_config() -> TideConfig {{{db_setup}
 }}
 
-/// Get the TideORM configuration for CLI usage
+/// Connect TideORM using the generated configuration.
+pub async fn connect_tideorm() -> tideorm::Result<&'static Database> {{
+    tideorm_config().connect().await
+}}
+
+/// Get the TideORM configuration for CLI usage.
 ///
-/// This function is called by the TideORM CLI to get the database configuration.
-/// It reads from environment variables to avoid hardcoding credentials.
+/// This returns the builder before `connect()` so callers can add extra options.
+#[allow(dead_code)]
 pub fn get_cli_config() -> TideConfig {{
-    dotenv::dotenv().ok();
-    init_tideorm()
+    tideorm_config()
 }}
 
 #[cfg(test)]
@@ -198,15 +221,64 @@ mod tests {{
 
     #[test]
     fn test_config_creation() {{
-        // This test just ensures the config can be created
-        // In a real scenario, you'd want to mock the environment
-        std::env::set_var("DATABASE_URL", "sqlite://test.db");
-        let _config = init_tideorm();
+        // This test just ensures the config can be created.
+        unsafe {{
+            std::env::set_var("DATABASE_URL", "sqlite://test.db");
+        }}
+        let _config = tideorm_config();
     }}
 }}
 "#,
         db_setup = db_setup
     )
+}
+
+fn infer_package_name(project_path: &std::path::Path) -> String {
+    project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(crate::utils::to_snake_case)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "tideorm_app".to_string())
+}
+
+fn generate_cargo_toml(package_name: &str, database: &str) -> String {
+    let database_feature = match database {
+        "sqlite" => "sqlite",
+        "mysql" => "mysql",
+        _ => "postgres",
+    };
+
+    format!(
+        r#"[package]
+name = "{package_name}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {{ version = "1", features = ["full"] }}
+tideorm = {{ version = "0.8.0", features = ["{database_feature}", "runtime-tokio"] }}
+"#,
+        package_name = package_name,
+        database_feature = database_feature,
+    )
+}
+
+fn generate_main_rs() -> String {
+    r#"mod config;
+mod factories;
+mod migrations;
+mod models;
+mod seeders;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    config::connect_tideorm().await?;
+    println!("TideORM project initialized.");
+    Ok(())
+}
+"#
+    .to_string()
 }
 
 /// Generate DatabaseSeeder content
@@ -219,16 +291,26 @@ fn generate_database_seeder() -> String {
 use tideorm::prelude::*;
 
 /// Database seeder - runs all seeders
+#[derive(Default)]
+#[allow(dead_code)]
 pub struct DatabaseSeeder;
 
-impl DatabaseSeeder {
-    /// Run all seeders
-    pub async fn run() -> tideorm::Result<()> {
+#[async_trait]
+impl Seed for DatabaseSeeder {
+    fn name(&self) -> &str {
+        "database_seeder"
+    }
+
+    async fn run(&self, _db: &Database) -> tideorm::Result<()> {
         println!("Running database seeders...");
 
         // Add your seeders here:
-        // UserSeeder::run().await?;
-        // PostSeeder::run().await?;
+        // let result = Seeder::new()
+        //     .add(UserSeeder::default())
+        //     .add(PostSeeder::default())
+        //     .run()
+        //     .await?;
+        // println!("{}", result);
 
         println!("Database seeding completed!");
         Ok(())
@@ -241,8 +323,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_seeder_runs() {
-        // This test just ensures the seeder can be called
-        // In a real scenario, you'd want to use a test database
+        let seeder = DatabaseSeeder::default();
+        assert_eq!(seeder.name(), "database_seeder");
     }
 }
 "#

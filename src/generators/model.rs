@@ -21,6 +21,7 @@ pub struct ModelGenerator<'a> {
     table: Option<String>,
     fields: Vec<FieldDefinition>,
     relations: Vec<RelationDefinition>,
+    parse_errors: Vec<String>,
     translatable: Vec<String>,
     attachments_single: Vec<String>,
     attachments_multi: Vec<String>,
@@ -42,6 +43,7 @@ impl<'a> ModelGenerator<'a> {
             table: None,
             fields: Vec::new(),
             relations: Vec::new(),
+            parse_errors: Vec::new(),
             translatable: Vec::new(),
             attachments_single: Vec::new(),
             attachments_multi: Vec::new(),
@@ -70,10 +72,17 @@ impl<'a> ModelGenerator<'a> {
     /// Set fields from string
     pub fn fields(mut self, fields: Option<String>) -> Self {
         if let Some(fields_str) = fields {
-            self.fields = fields_str
-                .split(',')
-                .filter_map(|f| FieldDefinition::parse(f.trim()).ok())
-                .collect();
+            for field in fields_str.split(',') {
+                let field = field.trim();
+                if field.is_empty() {
+                    continue;
+                }
+
+                match FieldDefinition::parse(field) {
+                    Ok(parsed) => self.fields.push(parsed),
+                    Err(err) => self.parse_errors.push(err),
+                }
+            }
         }
         self
     }
@@ -81,10 +90,17 @@ impl<'a> ModelGenerator<'a> {
     /// Set relations from string
     pub fn relations(mut self, relations: Option<String>) -> Self {
         if let Some(relations_str) = relations {
-            self.relations = relations_str
-                .split(',')
-                .filter_map(|r| RelationDefinition::parse(r.trim()).ok())
-                .collect();
+            for relation in relations_str.split(',') {
+                let relation = relation.trim();
+                if relation.is_empty() {
+                    continue;
+                }
+
+                match RelationDefinition::parse(relation) {
+                    Ok(parsed) => self.relations.push(parsed),
+                    Err(err) => self.parse_errors.push(err),
+                }
+            }
         }
         self
     }
@@ -185,6 +201,10 @@ impl<'a> ModelGenerator<'a> {
             return Err("Model name is required".to_string());
         }
 
+        if !self.parse_errors.is_empty() {
+            return Err(self.parse_errors.join("\n"));
+        }
+
         // Ensure output directory exists
         ensure_directory(&self.output_dir)?;
 
@@ -216,11 +236,6 @@ impl<'a> ModelGenerator<'a> {
 
         // Imports
         content.push_str("use tideorm::prelude::*;\n");
-        
-        // Add chrono if we have timestamps or soft deletes
-        if self.timestamps || self.soft_deletes {
-            content.push_str("use chrono::{DateTime, Utc};\n");
-        }
 
         content.push('\n');
 
@@ -288,28 +303,52 @@ impl<'a> ModelGenerator<'a> {
         for field_name in &self.indexed {
             lines.push(format!("#[index(\"{}\")]", field_name));
         }
+
+        for field_name in self.generated_indexed_fields() {
+            if !self.indexed.iter().any(|indexed| indexed == &field_name) {
+                lines.push(format!("#[index(\"{}\")]", field_name));
+            }
+        }
         
         // Unique index attributes (struct-level)
         for field_name in &self.unique {
             lines.push(format!("#[unique_index(\"{}\")]", field_name));
         }
 
+        for field_name in self.generated_unique_fields() {
+            if !self.unique.iter().any(|unique| unique == &field_name) {
+                lines.push(format!("#[unique_index(\"{}\")]", field_name));
+            }
+        }
+
         // Struct definition
         lines.push(format!("pub struct {} {{", self.name));
 
-        // Primary key
-        lines.push(format!(
-            "    #[tide(primary_key, auto_increment)]\n    pub {}: {},",
-            self.config.model.primary_key,
-            self.config.model.primary_key_type
-        ));
+        if !self.has_explicit_primary_key() {
+            lines.push(format!(
+                "    #[tide(primary_key, auto_increment)]\n    pub {}: {},",
+                self.config.model.primary_key,
+                self.config.model.primary_key_type
+            ));
+        }
 
         // Regular fields
-        for field in &self.fields {
+        for field in self.generated_fields() {
             let mut field_attrs = Vec::new();
+            let is_primary_key = field.primary_key || field.name == self.config.model.primary_key;
+            let is_auto_increment = field.auto_increment
+                || (is_primary_key && field.name == self.config.model.primary_key);
 
             // Check if this field should be nullable
             let is_nullable = field.nullable || self.nullable.contains(&field.name);
+
+            if is_primary_key {
+                field_attrs.push("primary_key".to_string());
+            }
+
+            if is_auto_increment {
+                field_attrs.push("auto_increment".to_string());
+            }
 
             if is_nullable {
                 field_attrs.push("nullable".to_string());
@@ -370,7 +409,7 @@ impl<'a> ModelGenerator<'a> {
         
         // Single attachment fields (files JSONB column)
         if !self.attachments_single.is_empty() || !self.attachments_multi.is_empty() {
-            lines.push("    /// JSONB column for file attachments\n    pub files: Option<serde_json::Value>,".to_string());
+            lines.push("    /// JSONB column for file attachments\n    pub files: Option<JsonValue>,".to_string());
         }
 
         // Timestamps (plain DateTime fields, no auto_now attributes)
@@ -397,12 +436,12 @@ impl<'a> ModelGenerator<'a> {
         impl_lines.push(format!("impl {} {{", self.name));
 
         // Custom finder methods for unique fields
-        for field in &self.fields {
+        for field in self.generated_fields() {
             if field.unique || self.unique.contains(&field.name) {
                 impl_lines.push(format!(
                     r#"    /// Find by {}
     pub async fn find_by_{}({}: &{}) -> tideorm::Result<Option<Self>> {{
-        Self::where_eq("{}", {}).first().await
+        Self::query().where_eq("{}", {}).first().await
     }}
 "#,
                     field.name,
@@ -418,6 +457,59 @@ impl<'a> ModelGenerator<'a> {
         impl_lines.push("}".to_string());
 
         impl_lines.join("\n")
+    }
+
+    fn generated_fields(&self) -> Vec<FieldDefinition> {
+        let mut fields = self.fields.clone();
+
+        for relation in &self.relations {
+            if relation.relation_type != RelationType::BelongsTo {
+                continue;
+            }
+
+            let foreign_key = relation.foreign_key.clone().unwrap_or_else(|| {
+                format!("{}_id", to_snake_case(&relation.related_model))
+            });
+
+            if fields.iter().any(|field| field.name == foreign_key) {
+                continue;
+            }
+
+            fields.push(FieldDefinition {
+                name: foreign_key,
+                field_type: self.config.model.primary_key_type.clone(),
+                nullable: false,
+                unique: false,
+                indexed: true,
+                primary_key: false,
+                auto_increment: false,
+                default: None,
+            });
+        }
+
+        fields
+    }
+
+    fn generated_indexed_fields(&self) -> Vec<String> {
+        self.generated_fields()
+            .into_iter()
+            .filter(|field| field.indexed)
+            .map(|field| field.name)
+            .collect()
+    }
+
+    fn generated_unique_fields(&self) -> Vec<String> {
+        self.generated_fields()
+            .into_iter()
+            .filter(|field| field.unique)
+            .map(|field| field.name)
+            .collect()
+    }
+
+    fn has_explicit_primary_key(&self) -> bool {
+        self.generated_fields().into_iter().any(|field| {
+            field.primary_key || field.name == self.config.model.primary_key
+        })
     }
 
     /// Update the mod.rs file to include the new model
@@ -466,6 +558,10 @@ mod tests {
         assert_eq!(field.field_type, "string");
         assert!(field.unique);
         assert!(field.indexed);
+
+        let field = FieldDefinition::parse("id:i64:primary_key:auto_increment").unwrap();
+        assert!(field.primary_key);
+        assert!(field.auto_increment);
     }
 
     #[test]
@@ -517,5 +613,19 @@ mod tests {
         assert!(content.contains("HasOne<Profile>"));
         assert!(content.contains("#[tide(has_many = \"Post\""));
         assert!(content.contains("#[tide(has_one = \"Profile\""));
+    }
+
+    #[test]
+    fn test_belongs_to_generates_foreign_key_field() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config)
+            .name("Post")
+            .relations(Some("author:belongs_to:User".to_string()));
+
+        let content = generator.generate_content();
+
+        assert!(content.contains("pub user_id: i64,"));
+        assert!(content.contains("#[index(\"user_id\")]"));
+        assert!(content.contains("pub author: BelongsTo<User>,"));
     }
 }

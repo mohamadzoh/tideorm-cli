@@ -33,13 +33,10 @@ pub async fn list(config_path: &str, verbose: bool) -> Result<(), String> {
         println!("\n  Create a model with:");
         println!(
             "    {}",
-            "tideorm make:model User --fields=\"name:string,email:string:unique\"".yellow()
+            "tideorm make model User --fields=\"name:string,email:string:unique\"".yellow()
         );
     } else {
-        println!(
-            "  {:<20} {:<30} {:<15} {}",
-            "Model", "Table", "Fields", "Features"
-        );
+        println!("  {:<20} {:<30} {:<15} Features", "Model", "Table", "Fields");
         println!("{}", "─".repeat(80));
 
         for model in &models {
@@ -92,7 +89,7 @@ fn scan_models(models_path: &str) -> Result<Vec<ModelInfo>, String> {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let file_path = entry.path();
 
-        if file_path.extension().map_or(false, |ext| ext == "rs") {
+        if file_path.extension().is_some_and(|ext| ext == "rs") {
             let name = file_path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -119,18 +116,20 @@ fn scan_models(models_path: &str) -> Result<Vec<ModelInfo>, String> {
 
 /// Parse a model file to extract information
 fn parse_model_file(content: &str) -> Option<ModelInfo> {
-    // Find struct name with #[derive(Model)]
-    let derive_model_pattern = regex::Regex::new(
-        r#"#\[derive\([^)]*Model[^)]*\)\]\s*(?:#\[tide\([^\]]*\)\]\s*)*pub\s+struct\s+(\w+)"#
+    // Find struct name with either #[tideorm::model] or #[derive(Model)]
+    let struct_pattern = regex::Regex::new(
+        r#"(?s)(?:#\[tideorm::model(?:\([^\]]*\))?\]\s*(?:#\[(?:tide|index|unique_index)[^\]]*\]\s*)*|#\[derive\([^)]*Model[^)]*\)\]\s*(?:#\[(?:tide|index|unique_index)[^\]]*\]\s*)*)pub\s+struct\s+(\w+)"#
     ).ok()?;
 
-    let struct_name = derive_model_pattern.captures(content)?.get(1)?.as_str();
+    let struct_name = struct_pattern.captures(content)?.get(1)?.as_str();
 
     // Find table name
-    let table_pattern = regex::Regex::new(r#"#\[tide\([^)]*table\s*=\s*"([^"]+)"[^)]*\)\]"#).ok()?;
+    let table_pattern = regex::Regex::new(
+        r#"(?:#\[tide\([^)]*table\s*=\s*"([^"]+)"[^)]*\)\]|#\[tideorm::model\([^\]]*table\s*=\s*"([^"]+)"[^\]]*\)\])"#
+    ).ok()?;
     let table = table_pattern
         .captures(content)
-        .and_then(|c| c.get(1))
+        .and_then(|c| c.get(1).or_else(|| c.get(2)))
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| crate::utils::pluralize(&crate::utils::to_snake_case(struct_name)));
 
@@ -170,4 +169,27 @@ fn parse_model_file(content: &str) -> Option<ModelInfo> {
         has_soft_deletes,
         has_tokenize,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_model_file;
+
+    #[test]
+    fn test_parse_tideorm_model_attribute() {
+        let content = r#"
+#[tideorm::model(table = "posts")]
+#[index("user_id")]
+pub struct Post {
+    pub id: i64,
+    pub user_id: i64,
+    pub title: String,
+}
+"#;
+
+        let model = parse_model_file(content).expect("model should parse");
+        assert_eq!(model.name, "Post");
+        assert_eq!(model.table, "posts");
+        assert_eq!(model.fields.len(), 3);
+    }
 }

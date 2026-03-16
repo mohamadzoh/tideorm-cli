@@ -78,22 +78,22 @@
                     <h2>Quick Actions</h2>
                 </div>
                 <div class="actions-grid">
-                    <div class="action-card cli-required" onclick="runCommand('migrate', 'migrate')">
+                    <div class="action-card cli-required" onclick="runCommand(['migrate', 'run'], 'migrate run')">
                         <div class="action-card-icon">▶️</div>
                         <h3>Migrate</h3>
                         <p>Run pending migrations</p>
                     </div>
-                    <div class="action-card cli-required" onclick="runCommand('migrate rollback', 'migrate rollback')">
+                    <div class="action-card cli-required" onclick="runCommand(['migrate', 'down'], 'migrate down')">
                         <div class="action-card-icon">⏪</div>
                         <h3>Rollback</h3>
                         <p>Undo last migration</p>
                     </div>
-                    <div class="action-card cli-required" onclick="runCommand('db seed', 'db seed')">
+                    <div class="action-card cli-required" onclick="runCommand(['db', 'seed'], 'db seed')">
                         <div class="action-card-icon">🌱</div>
                         <h3>Seed</h3>
                         <p>Run all seeders</p>
                     </div>
-                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate fresh', 'Migrate Fresh', 'This will drop ALL tables and re-run all migrations. All data will be lost!')">
+                    <div class="action-card danger cli-required" onclick="confirmDangerous(['migrate', 'fresh'], 'Migrate Fresh', 'This will drop ALL tables and re-run all migrations. All data will be lost!')">
                         <div class="action-card-icon">🔄</div>
                         <h3>Fresh Migrate</h3>
                         <p>Drop all & re-migrate</p>
@@ -234,32 +234,32 @@
                     <h2>Migration Commands</h2>
                 </div>
                 <div class="actions-grid">
-                    <div class="action-card cli-required" onclick="runCommand('migrate', 'migrate')">
+                    <div class="action-card cli-required" onclick="runCommand(['migrate', 'run'], 'migrate run')">
                         <div class="action-card-icon">▶️</div>
                         <h3>Run Migrations</h3>
                         <p>Apply all pending migrations</p>
                     </div>
-                    <div class="action-card cli-required" onclick="runCommand('migrate rollback', 'migrate rollback')">
+                    <div class="action-card cli-required" onclick="runCommand(['migrate', 'down'], 'migrate down')">
                         <div class="action-card-icon">⏪</div>
                         <h3>Rollback</h3>
                         <p>Undo the last batch</p>
                     </div>
-                    <div class="action-card cli-required" onclick="runCommand('migrate status', 'migrate status')">
+                    <div class="action-card cli-required" onclick="runCommand(['migrate', 'status'], 'migrate status')">
                         <div class="action-card-icon">📊</div>
                         <h3>Status</h3>
                         <p>View migration status</p>
                     </div>
-                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate fresh', 'Fresh Migration', 'This will DROP ALL TABLES and re-run all migrations from scratch. All data will be permanently lost!')">
+                    <div class="action-card danger cli-required" onclick="confirmDangerous(['migrate', 'fresh'], 'Fresh Migration', 'This will DROP ALL TABLES and re-run all migrations from scratch. All data will be permanently lost!')">
                         <div class="action-card-icon">🔄</div>
                         <h3>Fresh</h3>
                         <p>Drop all & re-migrate</p>
                     </div>
-                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate reset', 'Reset Migrations', 'This will roll back ALL migrations. All tables will be dropped!')">
+                    <div class="action-card danger cli-required" onclick="confirmDangerous(['migrate', 'reset'], 'Reset Migrations', 'This will roll back ALL migrations. All tables will be dropped!')">
                         <div class="action-card-icon">⏮️</div>
                         <h3>Reset</h3>
                         <p>Roll back all migrations</p>
                     </div>
-                    <div class="action-card danger cli-required" onclick="confirmDangerous('migrate refresh', 'Refresh Migrations', 'This will reset and re-run all migrations. All data will be lost!')">
+                    <div class="action-card danger cli-required" onclick="confirmDangerous(['migrate', 'refresh'], 'Refresh Migrations', 'This will reset and re-run all migrations. All data will be lost!')">
                         <div class="action-card-icon">🔃</div>
                         <h3>Refresh</h3>
                         <p>Reset & re-run all</p>
@@ -286,12 +286,12 @@
                     <h2>Seeder Commands</h2>
                 </div>
                 <div class="actions-grid">
-                    <div class="action-card cli-required" onclick="runCommand('db seed', 'db seed')">
+                    <div class="action-card cli-required" onclick="runCommand(['db', 'seed'], 'db seed')">
                         <div class="action-card-icon">🌱</div>
                         <h3>Run All Seeders</h3>
                         <p>Execute all database seeders</p>
                     </div>
-                    <div class="action-card danger cli-required" onclick="confirmDangerous('db seed --fresh', 'Fresh Seed', 'This will truncate all tables before seeding. All existing data will be deleted!')">
+                    <div class="action-card danger cli-required" onclick="confirmDangerous(['db', 'fresh'], 'Fresh Seed', 'This will truncate all tables before seeding. All existing data will be deleted!')">
                         <div class="action-card-icon">🔄</div>
                         <h3>Fresh Seed</h3>
                         <p>Truncate & re-seed all</p>
@@ -391,12 +391,12 @@
                     <h2>Database Operations</h2>
                 </div>
                 <div class="actions-grid">
-                    <div class="action-card cli-required" onclick="runCommand('db status', 'db status')">
+                    <div class="action-card cli-required" onclick="runCommand(['db', 'status'], 'db status')">
                         <div class="action-card-icon">📊</div>
                         <h3>Status</h3>
                         <p>Check connection status</p>
                     </div>
-                    <div class="action-card danger cli-required" onclick="confirmDangerous('db wipe', 'Wipe Database', 'This will DROP ALL TABLES in the database. This action cannot be undone!')">
+                    <div class="action-card danger cli-required" onclick="confirmDangerous(['db', 'wipe'], 'Wipe Database', 'This will DROP ALL TABLES in the database. This action cannot be undone!')">
                         <div class="action-card-icon">💥</div>
                         <h3>Wipe</h3>
                         <p>Drop all tables</p>

@@ -13,7 +13,7 @@
 //! tideorm migrate
 //!
 //! # Generate a model
-//! tideorm make:model User --fields="name:string,email:string:unique"
+//! tideorm make model User --fields="name:string,email:string:unique"
 //!
 //! # Run seeders
 //! tideorm db:seed
@@ -22,6 +22,7 @@
 mod commands;
 mod config;
 mod generators;
+mod runtime_db;
 mod utils;
 
 use clap::{Parser, Subcommand};
@@ -31,7 +32,7 @@ use colored::Colorize;
 #[derive(Parser)]
 #[command(name = "tideorm")]
 #[command(author = "TideORM Contributors")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Command-line interface for TideORM - A powerful Rust ORM", long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
@@ -259,7 +260,7 @@ enum MakeCommands {
         table: Option<String>,
 
         /// Fields (format: name:type[:modifiers...], comma-separated)
-        /// Types: string, text, i32, i64, f32, f64, bool, datetime, date, time, uuid, json, decimal
+        /// Types: string, text, i32, i64, f32, f64, bool, datetime, date, time, uuid, json, jsonb, decimal, bytes, int_array, bigint_array, text_array, bool_array, float_array, json_array
         /// Modifiers: nullable, unique, indexed, primary_key, auto_increment, default=value
         /// Example: --fields="name:string,email:string:unique,age:i32:nullable"
         #[arg(short, long)]
@@ -306,8 +307,14 @@ enum MakeCommands {
         #[arg(long, alias = "soft-delete")]
         soft_deletes: bool,
 
-        /// Enable timestamps (created_at, updated_at) - enabled by default, use --no-timestamps to disable
-        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        /// Enable timestamps (created_at, updated_at) - enabled by default, pass --timestamps=false to disable
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
         timestamps: bool,
 
         /// Enable tokenization

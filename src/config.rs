@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// TideORM CLI Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TideConfig {
     /// Project configuration
     #[serde(default)]
@@ -31,19 +31,6 @@ pub struct TideConfig {
     /// Model generation configuration
     #[serde(default)]
     pub model: ModelGenConfig,
-}
-
-impl Default for TideConfig {
-    fn default() -> Self {
-        Self {
-            project: ProjectConfig::default(),
-            database: DatabaseConfig::default(),
-            paths: PathsConfig::default(),
-            migration: MigrationConfig::default(),
-            seeder: SeederConfig::default(),
-            model: ModelGenConfig::default(),
-        }
-    }
 }
 
 /// Project configuration
@@ -294,7 +281,7 @@ impl Default for MigrationConfig {
 }
 
 fn default_migration_table() -> String {
-    "_tideorm_migrations".to_string()
+    "_migrations".to_string()
 }
 
 fn default_true() -> bool {
@@ -454,7 +441,7 @@ factories = "src/factories"
 config_file = "src/config.rs"
 
 [migration]
-table = "_tideorm_migrations"
+table = "_migrations"
 timestamps = true
 
 [seeder]
@@ -484,11 +471,13 @@ mod tests {
 
     #[test]
     fn test_connection_url_postgres() {
-        let mut config = DatabaseConfig::default();
-        config.driver = "postgres".to_string();
-        config.username = Some("user".to_string());
-        config.password = Some("pass".to_string());
-        config.database = Some("mydb".to_string());
+        let config = DatabaseConfig {
+            driver: "postgres".to_string(),
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            database: Some("mydb".to_string()),
+            ..Default::default()
+        };
 
         let url = config.connection_url();
         assert!(url.starts_with("postgres://"));
@@ -498,9 +487,11 @@ mod tests {
 
     #[test]
     fn test_connection_url_sqlite() {
-        let mut config = DatabaseConfig::default();
-        config.driver = "sqlite".to_string();
-        config.sqlite_path = Some("test.db".to_string());
+        let config = DatabaseConfig {
+            driver: "sqlite".to_string(),
+            sqlite_path: Some("test.db".to_string()),
+            ..Default::default()
+        };
 
         let url = config.connection_url();
         assert_eq!(url, "sqlite://test.db");
