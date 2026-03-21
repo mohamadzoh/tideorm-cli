@@ -112,6 +112,7 @@ async fn make_model(
     let fields_for_migration = prepare_model_migration_fields(
         fields.clone(),
         relations.as_deref(),
+        translatable.as_deref(),
         attachments_single.as_deref(),
         attachments_multi.as_deref(),
         &config.model.primary_key_type,
@@ -256,6 +257,7 @@ async fn make_factory(
 fn prepare_model_migration_fields(
     fields: Option<String>,
     relations: Option<&str>,
+    translatable: Option<&str>,
     attachments_single: Option<&str>,
     attachments_multi: Option<&str>,
     primary_key_type: &str,
@@ -299,6 +301,19 @@ fn prepare_model_migration_fields(
         }
     }
 
+    if translatable.is_some() {
+        let has_translations_column = field_defs.iter().any(|field| {
+            field
+                .split(':')
+                .next()
+                .is_some_and(|name| name.trim() == "translations")
+        });
+
+        if !has_translations_column {
+            field_defs.push("translations:jsonb:nullable".to_string());
+        }
+    }
+
     if attachments_single.is_some() || attachments_multi.is_some() {
         let has_files_column = field_defs.iter().any(|field| {
             field
@@ -330,6 +345,7 @@ mod tests {
             Some("author:belongs_to:User"),
             None,
             None,
+            None,
             "uuid",
         )
         .unwrap()
@@ -337,5 +353,22 @@ mod tests {
 
         assert!(fields.contains("title:string"));
         assert!(fields.contains("user_id:uuid:indexed"));
+    }
+
+    #[test]
+    fn test_prepare_model_migration_fields_adds_translations_column() {
+        let fields = prepare_model_migration_fields(
+            Some("title:string".to_string()),
+            None,
+            Some("title"),
+            None,
+            None,
+            "i64",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(fields.contains("title:string"));
+        assert!(fields.contains("translations:jsonb:nullable"));
     }
 }

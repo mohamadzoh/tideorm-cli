@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::io::Cursor;
 use std::path::Path;
-use tiny_http::{Header, Method, Response, Server};
+use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 #[derive(Deserialize)]
 struct ExecuteRequest {
@@ -116,10 +116,19 @@ pub async fn run(host: &str, port: u16, verbose: bool) -> Result<(), String> {
 
 /// Create an HTTP response with the given content and content type
 fn create_response(content: &str, content_type: &str) -> Response<Cursor<Vec<u8>>> {
+    create_response_with_status(content, content_type, 200)
+}
+
+fn create_response_with_status(
+    content: &str,
+    content_type: &str,
+    status_code: u16,
+) -> Response<Cursor<Vec<u8>>> {
     let data = content.as_bytes().to_vec();
     let len = data.len();
     
     Response::from_data(data)
+        .with_status_code(StatusCode(status_code))
         .with_header(
             Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap()
         )

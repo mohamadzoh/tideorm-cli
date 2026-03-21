@@ -1,6 +1,6 @@
 [package]
 name = "tideorm-cli"
-version = "0.8.0"
+version = "0.8.7"
 edition = "2024"
 description = "Command-line interface for TideORM"
 authors = ["Mohamad Al Zohbie"]
@@ -59,7 +59,7 @@ console = "0.16.3"
 tiny_http = "0.12"
 
 # Local TideORM runtime for live database access
-tideorm = {version = "*", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio"] }
+tideorm = {version = "0.8.7", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio"] }
 
 [features]
 default = []

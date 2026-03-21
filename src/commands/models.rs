@@ -118,14 +118,14 @@ fn scan_models(models_path: &str) -> Result<Vec<ModelInfo>, String> {
 fn parse_model_file(content: &str) -> Option<ModelInfo> {
     // Find struct name with either #[tideorm::model] or #[derive(Model)]
     let struct_pattern = regex::Regex::new(
-        r#"(?s)(?:#\[tideorm::model(?:\([^\]]*\))?\]\s*(?:#\[(?:tide|index|unique_index)[^\]]*\]\s*)*|#\[derive\([^)]*Model[^)]*\)\]\s*(?:#\[(?:tide|index|unique_index)[^\]]*\]\s*)*)pub\s+struct\s+(\w+)"#
+        r#"(?s)(?:#\[tideorm::model(?:\([^\]]*\))?\]\s*(?:#\[(?:tideorm|index|unique_index)[^\]]*\]\s*)*|#\[derive\([^)]*Model[^)]*\)\]\s*(?:#\[(?:tideorm|index|unique_index)[^\]]*\]\s*)*)pub\s+struct\s+(\w+)"#
     ).ok()?;
 
     let struct_name = struct_pattern.captures(content)?.get(1)?.as_str();
 
     // Find table name
     let table_pattern = regex::Regex::new(
-        r#"(?:#\[tide\([^)]*table\s*=\s*"([^"]+)"[^)]*\)\]|#\[tideorm::model\([^\]]*table\s*=\s*"([^"]+)"[^\]]*\)\])"#
+        r#"(?:#\[tideorm\([^)]*table\s*=\s*"([^"]+)"[^)]*\)\]|#\[tideorm::model\([^\]]*table\s*=\s*"([^"]+)"[^\]]*\)\])"#
     ).ok()?;
     let table = table_pattern
         .captures(content)
@@ -146,14 +146,14 @@ fn parse_model_file(content: &str) -> Option<ModelInfo> {
     let has_tokenize = content.contains("tokenize");
 
     // Find relations
-    let relation_pattern = regex::Regex::new(r#"#\[tide\([^)]*(?:belongs_to|has_one|has_many)[^)]*\)\]"#).ok()?;
+    let relation_pattern = regex::Regex::new(r#"#\[tideorm\([^)]*(?:belongs_to|has_one|has_many)[^)]*\)\]"#).ok()?;
     let relations: Vec<String> = relation_pattern
         .find_iter(content)
         .map(|m| m.as_str().to_string())
         .collect();
 
     // Find translatable fields
-    let translatable_pattern = regex::Regex::new(r#"#\[tide\([^)]*translatable[^)]*\)\]"#).ok()?;
+    let translatable_pattern = regex::Regex::new(r#"#\[tideorm\([^)]*translatable[^)]*\)\]"#).ok()?;
     let translatable: Vec<String> = translatable_pattern
         .find_iter(content)
         .map(|m| m.as_str().to_string())

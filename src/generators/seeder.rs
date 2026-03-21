@@ -58,7 +58,7 @@ impl<'a> SeederGenerator<'a> {
 //! Seeds the database with {} records.
 
 use tideorm::prelude::*;
-use crate::models::{model_pascal};
+use crate::models::{model_snake}::{model_pascal};
 
 /// {} seeder
 #[derive(Default)]
@@ -73,12 +73,12 @@ impl Seed for {seeder_name} {{
     async fn run(&self, _db: &Database) -> tideorm::Result<()> {{
         println!("Seeding {model_snake}s...");
 
-        for i in 1..={count} {{
+        for _i in 1..={count} {{
             let {model_snake} = {model_pascal} {{
                 // TODO: Fill in the model fields
                 // Example:
-                // name: format!("{model_pascal} {{}}", i),
-                // email: format!("{model_snake}{{}}@example.com", i),
+                // name: format!("{model_pascal} {{}}", _i),
+                // email: format!("{model_snake}{{}}@example.com", _i),
                 ..Default::default()
             }};
 
@@ -97,9 +97,9 @@ impl {seeder_name} {{
 
         // TODO: Use factory pattern
         // Example:
-        // {model_pascal}Factory::create_many({count}).await?;
+        // crate::factories::{model_snake}_factory::{model_pascal}Factory::create_many({count}).await?;
 
-        Self::default().run(&db()).await
+        Self::default().run(db()).await
     }}
 }}
 
@@ -196,10 +196,7 @@ mod tests {{
             return Ok(());
         }
 
-        let new_content = format!(
-            "{}{}\npub use {}::{};\n",
-            existing, module_decl, module_name, seeder_name
-        );
+        let new_content = format!("{}{}\n", existing, module_decl);
 
         std::fs::write(&mod_path, new_content)
             .map_err(|e| format!("Failed to update mod.rs: {}", e))?;
@@ -211,4 +208,20 @@ mod tests {{
 /// Convert string to PascalCase
 fn to_pascal_case(s: &str) -> String {
     heck::AsPascalCase(s).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeederGenerator;
+    use crate::config::TideConfig;
+
+    #[test]
+    fn model_seeder_uses_global_db_helper_without_double_reference() {
+        let config = TideConfig::default();
+        let generator = SeederGenerator::new(&config);
+        let content = generator.generate_model_seeder("UserSeeder", "User", 10);
+
+        assert!(content.contains("Self::default().run(db()).await"));
+        assert!(!content.contains("run(&db())"));
+    }
 }

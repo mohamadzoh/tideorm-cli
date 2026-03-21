@@ -1,7 +1,10 @@
 //! Migration generator for TideORM CLI
 
 use crate::config::TideConfig;
-use crate::utils::{ensure_directory, migration_timestamp, to_snake_case, FieldDefinition};
+use crate::utils::{
+    ensure_directory, migration_timestamp, render_template, to_snake_case, FieldDefinition,
+};
+use serde::Serialize;
 
 /// Migration generator
 pub struct MigrationGenerator<'a> {
@@ -59,11 +62,11 @@ impl<'a> MigrationGenerator<'a> {
                 &parsed_fields,
                 include_timestamps,
                 include_soft_deletes,
-            )
+            )?
         } else if let Some(table) = alter_table {
-            self.generate_alter_table(&migration_name, &version, &table, &parsed_fields)
+            self.generate_alter_table(&migration_name, &version, &table, &parsed_fields)?
         } else {
-            self.generate_empty(&migration_name, &version)
+            self.generate_empty(&migration_name, &version)?
         };
 
         std::fs::write(&file_path, content)
@@ -84,7 +87,7 @@ impl<'a> MigrationGenerator<'a> {
         fields: &[FieldDefinition],
         include_timestamps: bool,
         include_soft_deletes: bool,
-    ) -> String {
+    ) -> Result<String, String> {
         let struct_name = to_pascal_case(name);
         let driver = &self.config.database.driver;
 
@@ -120,40 +123,26 @@ impl<'a> MigrationGenerator<'a> {
             ));
         }
 
-        let columns_sql = columns.join(",\n");
+        let raw_sql = format!(
+            "        CREATE TABLE IF NOT EXISTS {} (\n{}\n        )",
+            table,
+            columns.join(",\n")
+        );
 
-        let mut content = String::new();
-        content.push_str(&format!("//! Migration: {}\n", name));
-        content.push_str("//!\n");
-        content.push_str(&format!("//! Creates the {} table.\n\n", table));
-        content.push_str("use tideorm::prelude::*;\n\n");
-        content.push_str(&format!("/// Migration: {}\n", name));
-        content.push_str(&format!("pub struct {};\n\n", struct_name));
-        content.push_str("#[async_trait]\n");
-        content.push_str(&format!("impl Migration for {} {{\n", struct_name));
-        content.push_str("    fn version(&self) -> &str {\n");
-        content.push_str(&format!("        \"{}\"\n", version));
-        content.push_str("    }\n\n");
-        content.push_str("    fn name(&self) -> &str {\n");
-        content.push_str(&format!("        \"{}\"\n", name));
-        content.push_str("    }\n\n");
-        content.push_str("    async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {\n");
-        content.push_str("        schema.raw(r#\"\n");
-        content.push_str(&format!("        CREATE TABLE IF NOT EXISTS {} (\n", table));
-        content.push_str(&columns_sql);
-        content.push_str("\n        )\n");
-        content.push_str("        \"#).await?;\n");
-        content.push_str("        \n");
-        content.push_str("        Ok(())\n");
-        content.push_str("    }\n\n");
-        content.push_str("    async fn down(&self, schema: &mut Schema) -> tideorm::Result<()> {\n");
-        content.push_str(&format!("        schema.raw(r#\"DROP TABLE IF EXISTS {}\"#).await?;\n", table));
-        content.push_str("        \n");
-        content.push_str("        Ok(())\n");
-        content.push_str("    }\n");
-        content.push_str("}\n");
+        let context = MigrationTemplateContext {
+            name: name.to_string(),
+            version: version.to_string(),
+            struct_name,
+            description: format!("Creates the {} table.", table),
+            up_mode: "raw_sql".to_string(),
+            down_mode: "raw_sql".to_string(),
+            up_raw_sql: Some(raw_sql),
+            down_raw_sql: Some(format!("DROP TABLE IF EXISTS {}", table)),
+            up_statements: Vec::new(),
+            down_statements: Vec::new(),
+        };
 
-        content
+        self.render_migration_template(&context)
     }
 
     /// Generate an alter table migration
@@ -163,7 +152,7 @@ impl<'a> MigrationGenerator<'a> {
         version: &str,
         table: &str,
         fields: &[FieldDefinition],
-    ) -> String {
+    ) -> Result<String, String> {
         let struct_name = to_pascal_case(name);
         let driver = &self.config.database.driver;
 
@@ -197,78 +186,65 @@ impl<'a> MigrationGenerator<'a> {
             ));
         }
 
-        let up_sql = up_statements.join("\n");
-        let down_sql = down_statements.join("\n");
+        let context = MigrationTemplateContext {
+            name: name.to_string(),
+            version: version.to_string(),
+            struct_name,
+            description: format!("Alters the {} table.", table),
+            up_mode: "statements".to_string(),
+            down_mode: "statements".to_string(),
+            up_raw_sql: None,
+            down_raw_sql: None,
+            up_statements,
+            down_statements,
+        };
 
-        let mut content = String::new();
-        content.push_str(&format!("//! Migration: {}\n", name));
-        content.push_str("//!\n");
-        content.push_str(&format!("//! Alters the {} table.\n\n", table));
-        content.push_str("use tideorm::prelude::*;\n\n");
-        content.push_str(&format!("/// Migration: {}\n", name));
-        content.push_str(&format!("pub struct {};\n\n", struct_name));
-        content.push_str("#[async_trait]\n");
-        content.push_str(&format!("impl Migration for {} {{\n", struct_name));
-        content.push_str("    fn version(&self) -> &str {\n");
-        content.push_str(&format!("        \"{}\"\n", version));
-        content.push_str("    }\n\n");
-        content.push_str("    fn name(&self) -> &str {\n");
-        content.push_str(&format!("        \"{}\"\n", name));
-        content.push_str("    }\n\n");
-        content.push_str("    async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {\n");
-        content.push_str(&up_sql);
-        content.push_str("\n        Ok(())\n");
-        content.push_str("    }\n\n");
-        content.push_str("    async fn down(&self, schema: &mut Schema) -> tideorm::Result<()> {\n");
-        content.push_str(&down_sql);
-        content.push_str("\n        Ok(())\n");
-        content.push_str("    }\n");
-        content.push_str("}\n");
-
-        content
+        self.render_migration_template(&context)
     }
 
     /// Generate an empty migration
-    fn generate_empty(&self, name: &str, version: &str) -> String {
+    fn generate_empty(&self, name: &str, version: &str) -> Result<String, String> {
         let struct_name = to_pascal_case(name);
 
-        let mut content = String::new();
-        content.push_str(&format!("//! Migration: {}\n", name));
-        content.push_str("//!\n");
-        content.push_str("//! TODO: Describe what this migration does.\n\n");
-        content.push_str("use tideorm::prelude::*;\n\n");
-        content.push_str(&format!("/// Migration: {}\n", name));
-        content.push_str(&format!("pub struct {};\n\n", struct_name));
-        content.push_str("#[async_trait]\n");
-        content.push_str(&format!("impl Migration for {} {{\n", struct_name));
-        content.push_str("    fn version(&self) -> &str {\n");
-        content.push_str(&format!("        \"{}\"\n", version));
-        content.push_str("    }\n\n");
-        content.push_str("    fn name(&self) -> &str {\n");
-        content.push_str(&format!("        \"{}\"\n", name));
-        content.push_str("    }\n\n");
-        content.push_str("    async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {\n");
-        content.push_str("        // TODO: Implement the forward migration\n");
-        content.push_str("        // Example:\n");
-        content.push_str("        // schema.raw(r#\"\n");
-        content.push_str("        //     CREATE TABLE example (\n");
-        content.push_str("        //         id BIGSERIAL PRIMARY KEY,\n");
-        content.push_str("        //         name VARCHAR(255) NOT NULL\n");
-        content.push_str("        //     )\n");
-        content.push_str("        // \"#).await?;\n");
-        content.push_str("        \n");
-        content.push_str("        Ok(())\n");
-        content.push_str("    }\n\n");
-        content.push_str("    async fn down(&self, schema: &mut Schema) -> tideorm::Result<()> {\n");
-        content.push_str("        // TODO: Implement the reverse migration\n");
-        content.push_str("        // Example:\n");
-        content.push_str("        // schema.raw(r#\"DROP TABLE IF EXISTS example\"#).await?;\n");
-        content.push_str("        \n");
-        content.push_str("        Ok(())\n");
-        content.push_str("    }\n");
-        content.push_str("}\n");
+        let context = MigrationTemplateContext {
+            name: name.to_string(),
+            version: version.to_string(),
+            struct_name,
+            description: "TODO: Describe what this migration does.".to_string(),
+            up_mode: "comments".to_string(),
+            down_mode: "comments".to_string(),
+            up_raw_sql: None,
+            down_raw_sql: None,
+            up_statements: vec![
+                "        // TODO: Implement the forward migration".to_string(),
+                "        // Example:".to_string(),
+                "        // schema.raw(r#\"".to_string(),
+                "        //     CREATE TABLE example (".to_string(),
+                "        //         id BIGSERIAL PRIMARY KEY,".to_string(),
+                "        //         name VARCHAR(255) NOT NULL".to_string(),
+                "        //     )".to_string(),
+                "        // \"#).await?;".to_string(),
+            ],
+            down_statements: vec![
+                "        // TODO: Implement the reverse migration".to_string(),
+                "        // Example:".to_string(),
+                "        // schema.raw(r#\"DROP TABLE IF EXISTS example\"#).await?;".to_string(),
+            ],
+        };
 
-        content
+        self.render_migration_template(&context)
+    }
+
+    fn render_migration_template(
+        &self,
+        context: &MigrationTemplateContext,
+    ) -> Result<String, String> {
+        render_template(
+            "migration",
+            DEFAULT_MIGRATION_TEMPLATE,
+            self.config.migration.template.as_deref(),
+            context,
+        )
     }
 
     fn parse_fields(fields: Option<&str>) -> Result<Vec<FieldDefinition>, String> {
@@ -379,25 +355,66 @@ impl<'a> MigrationGenerator<'a> {
             return Ok(());
         }
 
-        let struct_name = to_pascal_case(
-            file_stem
-                .split('_')
-                .skip(1) // Skip timestamp
-                .collect::<Vec<_>>()
-                .join("_")
-                .as_str(),
-        );
-
-        let new_content = format!(
-            "{}{}\npub use {}::{};\n",
-            existing, module_decl, module_name, struct_name
-        );
+        let new_content = format!("{}{}\n", existing, module_decl);
 
         std::fs::write(&mod_path, new_content)
             .map_err(|e| format!("Failed to update mod.rs: {}", e))?;
 
         Ok(())
     }
+}
+
+const DEFAULT_MIGRATION_TEMPLATE: &str = r##"//! Migration: {{ name }}
+//!
+//! {{ description }}
+
+use tideorm::prelude::*;
+
+/// Migration: {{ name }}
+pub struct {{ struct_name }};
+
+#[async_trait]
+impl Migration for {{ struct_name }} {
+    fn version(&self) -> &str {
+        "{{ version }}"
+    }
+
+    fn name(&self) -> &str {
+        "{{ name }}"
+    }
+
+    async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {
+{% if up_mode == "raw_sql" %}        schema.raw(r#"
+{{ up_raw_sql }}
+        "#).await?;
+{% else %}{% for statement in up_statements %}{{ statement }}
+{% endfor %}{% endif %}
+
+        Ok(())
+    }
+
+    async fn down(&self, schema: &mut Schema) -> tideorm::Result<()> {
+{% if down_mode == "raw_sql" %}        schema.raw(r#"{{ down_raw_sql }}"#).await?;
+{% else %}{% for statement in down_statements %}{{ statement }}
+{% endfor %}{% endif %}
+
+        Ok(())
+    }
+}
+"##;
+
+#[derive(Serialize)]
+struct MigrationTemplateContext {
+    name: String,
+    version: String,
+    struct_name: String,
+    description: String,
+    up_mode: String,
+    down_mode: String,
+    up_raw_sql: Option<String>,
+    down_raw_sql: Option<String>,
+    up_statements: Vec<String>,
+    down_statements: Vec<String>,
 }
 
 /// Convert string to PascalCase
@@ -420,6 +437,7 @@ fn migration_module_name(file_stem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_default_mysql_primary_key_sql_has_single_auto_increment() {
@@ -435,7 +453,7 @@ mod tests {
             &[],
             false,
             false,
-        );
+        ).unwrap();
 
         assert!(content.contains("id BIGINT PRIMARY KEY AUTO_INCREMENT"));
         assert!(!content.contains("AUTO_INCREMENT PRIMARY KEY AUTO_INCREMENT"));
@@ -456,7 +474,7 @@ mod tests {
             &fields,
             false,
             false,
-        );
+        ).unwrap();
 
         assert!(content.contains("custom_id INTEGER PRIMARY KEY AUTOINCREMENT"));
         assert!(!content.contains("custom_id BIGINT"));
@@ -469,5 +487,23 @@ mod tests {
             "m_20260316203329_create_posts_table"
         );
         assert_eq!(migration_module_name("create_posts_table"), "create_posts_table");
+    }
+
+    #[test]
+    fn test_migration_template_override_is_used() {
+        let dir = tempdir().unwrap();
+        let template_path = dir.path().join("migration.rs.j2");
+        std::fs::write(&template_path, "// custom migration {{ name }} {{ description }}\n").unwrap();
+
+        let mut config = TideConfig::default();
+        config.migration.template = Some(template_path.to_string_lossy().into_owned());
+        config.migration.timestamps = false;
+
+        let generator = MigrationGenerator::new(&config);
+        let content = generator
+            .generate_create_table("create_users_table", "20260316_001", "users", &[], false, false)
+            .unwrap();
+
+        assert_eq!(content, "// custom migration create_users_table Creates the users table.");
     }
 }

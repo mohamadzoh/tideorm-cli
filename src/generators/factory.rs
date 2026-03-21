@@ -53,7 +53,7 @@ impl<'a> FactoryGenerator<'a> {
 //! Factory for creating {} instances for testing and seeding.
 
 use tideorm::prelude::*;
-use crate::models::{model_pascal};
+use crate::models::{model_snake}::{model_pascal};
 
 /// Factory for creating {model_pascal} instances
 pub struct {factory_name};
@@ -64,17 +64,15 @@ impl {factory_name} {{
         {model_pascal} {{
             // TODO: Add default field values
             // Example:
-            // name: Self::fake_name(),
-            // email: Self::fake_email(),
+            // name: "Example".to_string(),
+            // email: "example@example.com".to_string(),
             ..Default::default()
         }}
     }}
 
     /// Create and save a single {model_pascal}
     pub async fn create() -> tideorm::Result<{model_pascal}> {{
-        let mut {model_snake} = Self::definition();
-        {model_snake}.save().await?;
-        Ok({model_snake})
+        Self::definition().save().await
     }}
 
     /// Create and save multiple {model_pascal}s
@@ -111,61 +109,9 @@ impl {factory_name} {{
     where
         F: FnOnce(&mut {model_pascal}),
     {{
-        let mut {model_snake} = Self::with(modifier);
-        {model_snake}.save().await?;
-        Ok({model_snake})
+        Self::with(modifier).save().await
     }}
 
-    // =========================================================================
-    // FAKE DATA GENERATORS
-    // =========================================================================
-
-    /// Generate a fake name
-    #[allow(dead_code)]
-    fn fake_name() -> String {{
-        static NAMES: &[&str] = &[
-            "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank",
-            "Grace", "Henry", "Ivy", "Jack", "Kate", "Leo",
-        ];
-        let idx = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as usize % NAMES.len();
-        NAMES[idx].to_string()
-    }}
-
-    /// Generate a fake email
-    #[allow(dead_code)]
-    fn fake_email() -> String {{
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("{model_snake}{{}}@example.com", timestamp % 1000000)
-    }}
-
-    /// Generate a random number in range
-    #[allow(dead_code)]
-    fn random_number(min: i32, max: i32) -> i32 {{
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i32;
-        min + (timestamp.abs() % (max - min + 1))
-    }}
-
-    /// Generate a random boolean
-    #[allow(dead_code)]
-    fn random_bool() -> bool {{
-        Self::random_number(0, 1) == 1
-    }}
-
-    /// Generate lorem ipsum text
-    #[allow(dead_code)]
-    fn lorem_ipsum(words: usize) -> String {{
-        static LOREM: &str = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua";
-        LOREM.split_whitespace().take(words).collect::<Vec<_>>().join(" ")
-    }}
 }}
 
 #[cfg(test)]
@@ -209,10 +155,7 @@ mod tests {{
             return Ok(());
         }
 
-        let new_content = format!(
-            "{}{}\npub use {}::{};\n",
-            existing, module_decl, module_name, factory_name
-        );
+        let new_content = format!("{}{}\n", existing, module_decl);
 
         std::fs::write(&mod_path, new_content)
             .map_err(|e| format!("Failed to update mod.rs: {}", e))?;

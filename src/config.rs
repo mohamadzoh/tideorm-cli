@@ -443,9 +443,11 @@ config_file = "src/config.rs"
 [migration]
 table = "_migrations"
 timestamps = true
+# template = "templates/migration.rs.j2"
 
 [seeder]
 default_seeder = "DatabaseSeeder"
+# template = "templates/seeder.rs.j2"
 
 [model]
 timestamps = true
@@ -453,6 +455,7 @@ soft_deletes = false
 tokenize = false
 primary_key = "id"
 primary_key_type = "i64"
+# template = "templates/model.rs.j2"
 "#,
         db_config = db_config
     )

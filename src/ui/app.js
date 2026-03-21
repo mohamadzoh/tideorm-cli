@@ -249,6 +249,11 @@ function runSpecificSeeder() {
 
 // Query playground
 async function executeQuery() {
+    if (!configExists) {
+        showToast('warning', 'Configuration Required', 'Run "tideorm init" to create tideorm.toml first.');
+        return;
+    }
+
     const query = document.getElementById('query-input').value.trim();
     const resultsEl = document.getElementById('query-results');
     const timeEl = document.getElementById('query-time');
@@ -269,6 +274,11 @@ async function executeQuery() {
 }
 
 async function executeQueryDirect(query) {
+    if (!configExists) {
+        showToast('warning', 'Configuration Required', 'Run "tideorm init" to create tideorm.toml first.');
+        return;
+    }
+
     const resultsEl = document.getElementById('query-results');
     const timeEl = document.getElementById('query-time');
     

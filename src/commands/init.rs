@@ -210,7 +210,6 @@ pub async fn connect_tideorm() -> tideorm::Result<&'static Database> {{
 /// Get the TideORM configuration for CLI usage.
 ///
 /// This returns the builder before `connect()` so callers can add extra options.
-#[allow(dead_code)]
 pub fn get_cli_config() -> TideConfig {{
     tideorm_config()
 }}
@@ -257,7 +256,9 @@ edition = "2024"
 
 [dependencies]
 tokio = {{ version = "1", features = ["full"] }}
-tideorm = {{ version = "0.8.0", features = ["{database_feature}", "runtime-tokio"] }}
+serde = {{ version = "1", features = ["derive"] }}
+chrono = "0.4"
+tideorm = {{ version = "0.8.7", features = ["{database_feature}", "runtime-tokio"] }}
 "#,
         package_name = package_name,
         database_feature = database_feature,
@@ -265,11 +266,11 @@ tideorm = {{ version = "0.8.0", features = ["{database_feature}", "runtime-tokio
 }
 
 fn generate_main_rs() -> String {
-    r#"mod config;
-mod factories;
-mod migrations;
-mod models;
-mod seeders;
+    r#"pub mod config;
+pub mod factories;
+pub mod migrations;
+pub mod models;
+pub mod seeders;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -292,7 +293,6 @@ use tideorm::prelude::*;
 
 /// Database seeder - runs all seeders
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct DatabaseSeeder;
 
 #[async_trait]
@@ -329,4 +329,26 @@ mod tests {
 }
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_cargo_toml, infer_package_name};
+
+    #[test]
+    fn generated_cargo_toml_uses_current_tideorm_version() {
+        let cargo_toml = generate_cargo_toml("demo_app", "sqlite");
+
+        assert!(cargo_toml.contains("tideorm = { version = \"0.8.7\""));
+        assert!(cargo_toml.contains("serde = { version = \"1\", features = [\"derive\"] }"));
+        assert!(cargo_toml.contains("chrono = \"0.4\""));
+        assert!(cargo_toml.contains("features = [\"sqlite\", \"runtime-tokio\"]"));
+    }
+
+    #[test]
+    fn infer_package_name_falls_back_for_empty_paths() {
+        let package_name = infer_package_name(std::path::Path::new(""));
+
+        assert_eq!(package_name, "tideorm_app");
+    }
 }

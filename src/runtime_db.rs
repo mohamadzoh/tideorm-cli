@@ -52,7 +52,11 @@ pub async fn query_json(config: &TideConfig, sql: &str) -> Result<Vec<Value>, St
 }
 
 pub async fn execute_on_db(db: &Database, sql: &str) -> Result<u64, String> {
-    db.__internal_connection()
+    let connection = db
+        .__internal_connection()
+        .map_err(|error| error.to_string())?;
+
+    connection
         .execute_unprepared(sql)
         .await
         .map(|result| result.rows_affected())
@@ -60,10 +64,12 @@ pub async fn execute_on_db(db: &Database, sql: &str) -> Result<u64, String> {
 }
 
 pub async fn query_json_on_db(db: &Database, sql: &str) -> Result<Vec<Value>, String> {
-    let backend = db.__internal_connection().get_database_backend();
-    let statement = Statement::from_string(backend, sql.to_string());
-    let rows = db
+    let connection = db
         .__internal_connection()
+        .map_err(|error| error.to_string())?;
+    let backend = connection.get_database_backend();
+    let statement = Statement::from_string(backend, sql.to_string());
+    let rows = connection
         .query_all_raw(statement)
         .await
         .map_err(|error| error.to_string())?;

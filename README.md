@@ -306,29 +306,28 @@ use tideorm::prelude::*;
 use super::post::Post;
 use super::company::Company;
 
-#[tideorm::model]
-#[tide(table = "users", soft_delete, tokenize)]
+#[tideorm::model(table = "users", soft_delete, tokenize)]
 #[index("email")]
 #[unique_index("email")]
 pub struct User {
-    #[tide(primary_key, auto_increment)]
+    #[tideorm(primary_key, auto_increment)]
     pub id: i64,
     pub name: String,
     pub email: String,
-    #[tide(nullable)]
+    #[tideorm(nullable)]
     pub age: Option<i32>,
-    #[tide(has_many = "Post", foreign_key = "user_id")]
+    #[tideorm(has_many = "Post", foreign_key = "user_id")]
     pub posts: HasMany<Post>,
-    #[tide(belongs_to = "Company", foreign_key = "company_id")]
+    #[tideorm(belongs_to = "Company", foreign_key = "company_id")]
     pub company: BelongsTo<Company>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub deleted_at: Option<DateTime<Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl User {
     /// Find by email
-    pub async fn find_by_email(email: &String) -> tideorm::Result<Option<Self>> {
+    pub async fn find_by_email(email: &str) -> tideorm::Result<Option<Self>> {
         Self::query().where_eq("email", email).first().await
     }
 }
@@ -381,20 +380,25 @@ impl Migration for CreateUsersTable {
 //! UserSeeder
 
 use tideorm::prelude::*;
-use crate::models::User;
+use crate::models::user::User;
 
+#[derive(Default)]
 pub struct UserSeeder;
 
-impl UserSeeder {
-    pub async fn run() -> tideorm::Result<()> {
-        for i in 1..=10 {
-            let user = User {
-                id: 0,
-                name: format!("User {}", i),
-                email: format!("user{}@example.com", i),
+#[async_trait]
+impl Seed for UserSeeder {
+    fn name(&self) -> &str {
+        "user_seeder"
+    }
+
+    async fn run(&self, _db: &Database) -> tideorm::Result<()> {
+        for _i in 1..=10 {
+            User {
+                // Fill in the model fields for your project.
                 ..Default::default()
-            };
-            user.save().await?;
+            }
+            .save()
+            .await?;
         }
         Ok(())
     }

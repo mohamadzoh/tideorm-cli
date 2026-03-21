@@ -1,6 +1,8 @@
 //! Utility functions for TideORM CLI
 
 use colored::Colorize;
+use minijinja::{AutoEscape, Environment};
+use serde::Serialize;
 use std::path::Path;
 
 /// Print a success message
@@ -33,6 +35,30 @@ pub fn file_exists(path: &str) -> bool {
     Path::new(path).exists()
 }
 
+/// Render generator output from a MiniJinja template.
+pub fn render_template<T: Serialize>(
+    template_name: &str,
+    default_template: &str,
+    template_path: Option<&str>,
+    context: &T,
+) -> Result<String, String> {
+    let source = match template_path.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|error| format!("Failed to read {} template '{}': {}", template_name, path, error))?,
+        None => default_template.to_string(),
+    };
+
+    let mut env = Environment::new();
+    env.set_auto_escape_callback(|_| AutoEscape::None);
+    env.add_template(template_name, &source)
+        .map_err(|error| format!("Failed to parse {} template: {}", template_name, error))?;
+
+    env.get_template(template_name)
+        .map_err(|error| format!("Failed to load {} template: {}", template_name, error))?
+        .render(context)
+        .map_err(|error| format!("Failed to render {} template: {}", template_name, error))
+}
+
 /// Generate a timestamp for migration names
 pub fn migration_timestamp() -> String {
     chrono::Utc::now().format("%Y%m%d%H%M%S").to_string()
@@ -54,7 +80,7 @@ pub fn pluralize(word: &str) -> String {
 }
 
 /// Singularize a word
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn singularize(word: &str) -> String {
     pluralizer::pluralize(word, 1, false)
 }
@@ -62,7 +88,6 @@ pub fn singularize(word: &str) -> String {
 /// Parse field definition string
 /// Format: name:type[:modifier1:modifier2...]
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FieldDefinition {
     pub name: String,
     pub field_type: String,
