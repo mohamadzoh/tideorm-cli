@@ -19,6 +19,7 @@ pub async fn show(config_path: &str, verbose: bool) -> Result<(), String> {
     println!("\n{}", "[project]".yellow());
     println!("  name = \"{}\"", config.project.name);
     println!("  environment = \"{}\"", config.project.environment);
+    println!("  env_file = \"{}\"", config.project.env_file);
 
     // Database
     println!("\n{}", "[database]".yellow());

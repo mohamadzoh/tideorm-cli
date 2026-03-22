@@ -423,6 +423,9 @@ enum DbCommands {
     /// Show database connection status
     Status,
 
+    /// Initialize TideORM metadata tables in the current database
+    Check,
+
     /// Create the database
     Create {
         /// Database name

@@ -231,6 +231,9 @@ tideorm db fresh
 # Show database connection status
 tideorm db status
 
+# Initialize TideORM metadata tables
+tideorm db check
+
 # Create the database
 tideorm db create
 

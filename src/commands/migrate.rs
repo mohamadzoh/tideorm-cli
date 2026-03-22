@@ -2,11 +2,14 @@
 
 use crate::config::TideConfig;
 use crate::generators::migration::MigrationGenerator;
+use crate::runtime_db;
 use crate::utils::{self, print_info, print_success, print_warning};
 use crate::MigrateCommands;
 use colored::Colorize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use tideorm::internal::{ConnectionTrait, Statement};
 
 /// Run pending migrations
 pub async fn run(
@@ -18,11 +21,8 @@ pub async fn run(
 ) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    // Safety check for production
     if config.is_production() && !force {
-        return Err(
-            "Cannot run migrations in production without --force flag".to_string()
-        );
+        return Err("Cannot run migrations in production without --force flag".to_string());
     }
 
     let migrations_path = path.as_deref().unwrap_or(&config.paths.migrations);
@@ -33,15 +33,14 @@ pub async fn run(
         print_warning("Running in pretend mode - no changes will be made");
     }
 
-    // Get pending migrations
-    let migrations = get_pending_migrations(migrations_path)?;
+    let migrations = get_pending_migrations(&config, migrations_path).await?;
 
     if migrations.is_empty() {
         print_success("Nothing to migrate");
         return Ok(());
     }
 
-    let migrations_to_run = match step {
+    let migrations_to_run: Vec<_> = match step {
         Some(n) => migrations.into_iter().take(n as usize).collect(),
         None => migrations,
     };
@@ -51,35 +50,30 @@ pub async fn run(
         format!("[{}]", migrations_to_run.len()).cyan()
     );
 
-    for (i, migration) in migrations_to_run.iter().enumerate() {
-        println!("  {}. {}", i + 1, migration.name.yellow());
+    for (index, migration) in migrations_to_run.iter().enumerate() {
+        println!("  {}. {}", index + 1, migration.file_name.yellow());
     }
 
     if pretend {
         println!("\n{}", "Pretend mode - showing SQL:".cyan());
         for migration in &migrations_to_run {
-            println!("\n-- Migration: {}", migration.name);
+            println!("\n-- Migration: {}", migration.file_name);
             println!("-- Up:");
             println!("{}", migration.up_sql);
         }
         return Ok(());
     }
 
-    // Run migrations
     println!("\n{}", "Running migrations...".cyan());
 
     for migration in &migrations_to_run {
-        print!("  Migrating: {}... ", migration.name);
+        print!("  Migrating: {}... ", migration.file_name);
 
-        // Here we would actually run the migration against the database
-        // For now, we simulate success
         match run_migration_up(&config, migration).await {
-            Ok(()) => {
-                println!("{}", "DONE".green());
-            }
-            Err(e) => {
+            Ok(()) => println!("{}", "DONE".green()),
+            Err(error) => {
                 println!("{}", "FAILED".red());
-                return Err(format!("Migration failed: {}", e));
+                return Err(format!("Migration failed: {}", error));
             }
         }
     }
@@ -105,44 +99,35 @@ pub async fn handle_subcommand(
             force,
             step,
         } => run(config_path, path, pretend, force, step).await,
-
         MigrateCommands::Generate {
             name,
             create,
             table,
             fields,
         } => generate_migration(config_path, &name, create, table, fields, verbose).await,
-
         MigrateCommands::Up {
             step,
             migration,
             pretend,
         } => migrate_up(config_path, step, migration, pretend, verbose).await,
-
         MigrateCommands::Down {
             step,
             migration,
             pretend,
         } => migrate_down(config_path, step, migration, pretend, verbose).await,
-
         MigrateCommands::Redo { step, pretend } => {
             migrate_redo(config_path, step, pretend, verbose).await
         }
-
         MigrateCommands::Fresh { seed, seeder, force } => {
             migrate_fresh(config_path, seed, seeder, force, verbose).await
         }
-
         MigrateCommands::Reset { force, pretend } => {
             migrate_reset(config_path, force, pretend, verbose).await
         }
-
         MigrateCommands::Refresh { seed, step, force } => {
             migrate_refresh(config_path, seed, step, force, verbose).await
         }
-
         MigrateCommands::Status => migration_status(config_path, verbose).await,
-
         MigrateCommands::History { limit } => migration_history(config_path, limit, verbose).await,
     }
 }
@@ -185,7 +170,6 @@ async fn migrate_up(
     }
 
     if let Some(migration_name) = migration {
-        // Run specific migration
         print_info(&format!("Running specific migration: {}", migration_name));
 
         let migration = find_migration(&config.paths.migrations, &migration_name)?;
@@ -196,10 +180,14 @@ async fn migrate_up(
             return Ok(());
         }
 
+        let ran_migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
+        if ran_migrations.iter().any(|ran| ran.version == migration.version) {
+            return Err(format!("Migration already ran: {}", migration.file_name));
+        }
+
         run_migration_up(&config, &migration).await?;
         print_success(&format!("Migration {} completed", migration_name));
     } else {
-        // Run all pending or limited by step
         run(config_path, None, pretend, true, step).await?;
     }
 
@@ -221,7 +209,6 @@ async fn migrate_down(
     }
 
     if let Some(migration_name) = migration {
-        // Rollback specific migration
         let migration = find_migration(&config.paths.migrations, &migration_name)?;
 
         if pretend {
@@ -230,12 +217,17 @@ async fn migrate_down(
             return Ok(());
         }
 
+        let ran_migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
+        if !ran_migrations.iter().any(|ran| ran.version == migration.version) {
+            return Err(format!("Migration has not been run: {}", migration.file_name));
+        }
+
         run_migration_down(&config, &migration).await?;
         print_success(&format!("Rolled back migration: {}", migration_name));
     } else {
-        // Rollback last N migrations
-        let migrations = get_ran_migrations(&config.paths.migrations)?;
-        let migrations_to_rollback: Vec<_> = migrations.into_iter().rev().take(step as usize).collect();
+        let migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
+        let migrations_to_rollback: Vec<_> =
+            migrations.into_iter().rev().take(step as usize).collect();
 
         if migrations_to_rollback.is_empty() {
             print_info("Nothing to rollback");
@@ -244,15 +236,15 @@ async fn migrate_down(
 
         if pretend {
             println!("\n{}", "Pretend mode - migrations to rollback:".cyan());
-            for m in &migrations_to_rollback {
-                println!("\n-- Migration: {}", m.name);
-                println!("{}", m.down_sql);
+            for migration in &migrations_to_rollback {
+                println!("\n-- Migration: {}", migration.file_name);
+                println!("{}", migration.down_sql);
             }
             return Ok(());
         }
 
         for migration in &migrations_to_rollback {
-            print!("  Rolling back: {}... ", migration.name);
+            print!("  Rolling back: {}... ", migration.file_name);
             run_migration_down(&config, migration).await?;
             println!("{}", "DONE".green());
         }
@@ -277,10 +269,7 @@ async fn migrate_redo(
         print_info(&format!("Redoing {} migration(s)...", step));
     }
 
-    // Rollback
     migrate_down(config_path, step, None, pretend, verbose).await?;
-
-    // Re-run
     migrate_up(config_path, Some(step), None, pretend, verbose).await?;
 
     print_success(&format!("Redid {} migration(s)", step));
@@ -299,18 +288,16 @@ async fn migrate_fresh(
     let config = TideConfig::load(config_path)?;
 
     if config.is_production() && !force {
-        return Err(
-            "Cannot run migrate:fresh in production without --force flag".to_string()
-        );
+        return Err("Cannot run migrate:fresh in production without --force flag".to_string());
     }
 
     if verbose {
         print_warning("This will drop ALL tables and re-run all migrations!");
     }
 
-    // Confirm in production
     if config.is_production()
-        && !utils::confirm("Are you sure you want to drop all tables in PRODUCTION?") {
+        && !utils::confirm("Are you sure you want to drop all tables in PRODUCTION?")
+    {
         print_info("Operation cancelled");
         return Ok(());
     }
@@ -319,10 +306,8 @@ async fn migrate_fresh(
     drop_all_tables(&config).await?;
     print_success("Dropped all tables");
 
-    // Run all migrations
     run(config_path, None, false, true, None).await?;
 
-    // Run seeders if requested
     if seed {
         print_info("Running seeders...");
         crate::commands::db::seed(config_path, seeder, true, verbose).await?;
@@ -343,16 +328,14 @@ async fn migrate_reset(
     let config = TideConfig::load(config_path)?;
 
     if config.is_production() && !force {
-        return Err(
-            "Cannot run migrate:reset in production without --force flag".to_string()
-        );
+        return Err("Cannot run migrate:reset in production without --force flag".to_string());
     }
 
     if verbose {
         print_warning("This will rollback ALL migrations!");
     }
 
-    let migrations = get_ran_migrations(&config.paths.migrations)?;
+    let migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
 
     if migrations.is_empty() {
         print_info("Nothing to reset");
@@ -361,8 +344,8 @@ async fn migrate_reset(
 
     if pretend {
         println!("\n{}", "Pretend mode - migrations to rollback:".cyan());
-        for m in migrations.iter().rev() {
-            println!("  - {}", m.name);
+        for migration in migrations.iter().rev() {
+            println!("  - {}", migration.file_name);
         }
         return Ok(());
     }
@@ -370,7 +353,7 @@ async fn migrate_reset(
     println!("Rolling back {} migration(s)...", migrations.len());
 
     for migration in migrations.iter().rev() {
-        print!("  Rolling back: {}... ", migration.name);
+        print!("  Rolling back: {}... ", migration.file_name);
         run_migration_down(&config, migration).await?;
         println!("{}", "DONE".green());
     }
@@ -391,24 +374,17 @@ async fn migrate_refresh(
     let config = TideConfig::load(config_path)?;
 
     if config.is_production() && !force {
-        return Err(
-            "Cannot run migrate:refresh in production without --force flag".to_string()
-        );
+        return Err("Cannot run migrate:refresh in production without --force flag".to_string());
     }
 
-    if let Some(n) = step {
-        // Rollback N migrations
-        migrate_down(config_path, n, None, false, verbose).await?;
-        // Re-run N migrations
-        migrate_up(config_path, Some(n), None, false, verbose).await?;
+    if let Some(count) = step {
+        migrate_down(config_path, count, None, false, verbose).await?;
+        migrate_up(config_path, Some(count), None, false, verbose).await?;
     } else {
-        // Reset all
         migrate_reset(config_path, force, false, verbose).await?;
-        // Run all
         run(config_path, None, false, true, None).await?;
     }
 
-    // Run seeders if requested
     if seed {
         print_info("Running seeders...");
         crate::commands::db::seed(config_path, None, true, verbose).await?;
@@ -428,7 +404,7 @@ async fn migration_status(config_path: &str, verbose: bool) -> Result<(), String
     }
 
     let all_migrations = get_all_migrations(&config.paths.migrations)?;
-    let ran_migrations = get_ran_migrations(&config.paths.migrations)?;
+    let ran_migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
 
     println!("\n{}", "Migration Status:".cyan().bold());
     println!("{}", "─".repeat(60));
@@ -438,15 +414,18 @@ async fn migration_status(config_path: &str, verbose: bool) -> Result<(), String
         return Ok(());
     }
 
-    let ran_names: std::collections::HashSet<_> = ran_migrations.iter().map(|m| &m.name).collect();
+    let ran_names: HashSet<_> = ran_migrations
+        .iter()
+        .map(|migration| migration.version.as_str())
+        .collect();
 
     for migration in &all_migrations {
-        let status = if ran_names.contains(&migration.name) {
+        let status = if ran_names.contains(migration.version.as_str()) {
             "Ran".green()
         } else {
             "Pending".yellow()
         };
-        println!("  {} {}", status, migration.name);
+        println!("  {} {}", status, migration.file_name);
     }
 
     println!("{}", "─".repeat(60));
@@ -468,14 +447,11 @@ async fn migration_history(config_path: &str, limit: u32, verbose: bool) -> Resu
         print_info(&format!("Showing last {} migrations...", limit));
     }
 
-    let ran_migrations = get_ran_migrations(&config.paths.migrations)?;
+    let ran_migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
 
     println!("\n{}", "Migration History:".cyan().bold());
     println!("{}", "─".repeat(80));
-    println!(
-        "  {:<6} {:<40} {:<20}",
-        "Batch", "Migration", "Ran At"
-    );
+    println!("  {:<16} {:<40} {:<20}", "Version", "Migration", "Applied At");
     println!("{}", "─".repeat(80));
 
     if ran_migrations.is_empty() {
@@ -483,13 +459,12 @@ async fn migration_history(config_path: &str, limit: u32, verbose: bool) -> Resu
         return Ok(());
     }
 
-    for (i, migration) in ran_migrations.iter().rev().take(limit as usize).enumerate() {
-        let batch = ran_migrations.len() - i;
+    for migration in ran_migrations.iter().rev().take(limit as usize) {
         println!(
-            "  {:<6} {:<40} {:<20}",
-            batch,
-            migration.name,
-            migration.ran_at.as_deref().unwrap_or("N/A")
+            "  {:<16} {:<40} {:<20}",
+            migration.version,
+            migration.file_name,
+            migration.applied_at.as_deref().unwrap_or("N/A")
         );
     }
 
@@ -505,10 +480,12 @@ async fn migration_history(config_path: &str, limit: u32, verbose: bool) -> Resu
 /// Migration information
 #[derive(Debug, Clone)]
 pub struct Migration {
+    pub file_name: String,
+    pub version: String,
     pub name: String,
     pub up_sql: String,
     pub down_sql: String,
-    pub ran_at: Option<String>,
+    pub applied_at: Option<String>,
 }
 
 /// Get all migrations from the migrations directory
@@ -521,14 +498,16 @@ fn get_all_migrations(migrations_path: &str) -> Result<Vec<Migration>, String> {
 
     let mut migrations = Vec::new();
 
-    for entry in fs::read_dir(path).map_err(|e| format!("Failed to read migrations directory: {}", e))? {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+    for entry in
+        fs::read_dir(path).map_err(|error| format!("Failed to read migrations directory: {}", error))?
+    {
+        let entry = entry.map_err(|error| format!("Failed to read entry: {}", error))?;
         let file_path = entry.path();
 
         if file_path.extension().is_some_and(|ext| ext == "rs") {
             let name = file_path
                 .file_stem()
-                .and_then(|s| s.to_str())
+                .and_then(|stem| stem.to_str())
                 .unwrap_or("")
                 .to_string();
 
@@ -537,39 +516,121 @@ fn get_all_migrations(migrations_path: &str) -> Result<Vec<Migration>, String> {
             }
 
             let content = fs::read_to_string(&file_path)
-                .map_err(|e| format!("Failed to read migration file: {}", e))?;
+                .map_err(|error| format!("Failed to read migration file: {}", error))?;
 
+            let (version, logical_name) = parse_migration_metadata(&name, &content);
             let (up_sql, down_sql) = parse_migration_content(&content);
 
             migrations.push(Migration {
-                name,
+                file_name: name,
+                version,
+                name: logical_name,
                 up_sql,
                 down_sql,
-                ran_at: None,
+                applied_at: None,
             });
         }
     }
 
-    migrations.sort_by(|a, b| a.name.cmp(&b.name));
+    migrations.sort_by(|left, right| left.version.cmp(&right.version));
 
     Ok(migrations)
 }
 
 /// Get pending migrations (not yet run)
-fn get_pending_migrations(migrations_path: &str) -> Result<Vec<Migration>, String> {
+async fn get_pending_migrations(
+    config: &TideConfig,
+    migrations_path: &str,
+) -> Result<Vec<Migration>, String> {
     let all = get_all_migrations(migrations_path)?;
-    let ran = get_ran_migrations(migrations_path)?;
-    let ran_names: std::collections::HashSet<_> = ran.iter().map(|m| &m.name).collect();
+    let ran = get_ran_migrations(config, migrations_path).await?;
+    let ran_versions: HashSet<_> = ran.iter().map(|migration| migration.version.as_str()).collect();
 
-    Ok(all.into_iter().filter(|m| !ran_names.contains(&m.name)).collect())
+    Ok(all
+        .into_iter()
+        .filter(|migration| !ran_versions.contains(migration.version.as_str()))
+        .collect())
 }
 
 /// Get migrations that have been run
-/// In a real implementation, this would query the migrations table
-fn get_ran_migrations(_migrations_path: &str) -> Result<Vec<Migration>, String> {
-    // TODO: Query the database migrations table
-    // For now, return empty (simulating fresh state)
-    Ok(vec![])
+async fn get_ran_migrations(
+    config: &TideConfig,
+    migrations_path: &str,
+) -> Result<Vec<Migration>, String> {
+    runtime_db::ensure_migration_table(config, &config.migration.table).await?;
+    let db = runtime_db::connect(config).await?;
+
+    let all_migrations = get_all_migrations(migrations_path)?;
+    let all_by_name: HashMap<_, _> = all_migrations
+        .into_iter()
+        .map(|migration| (migration.version.clone(), migration))
+        .collect();
+
+    let connection = db
+        .__internal_connection()
+        .map_err(|error| error.to_string())?;
+    let backend = connection.get_database_backend();
+    let statement = Statement::from_string(
+        backend,
+        migration_records_query(config, &config.migration.table),
+    );
+    let rows = connection
+        .query_all_raw(statement)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let mut migrations = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let version = match row.try_get::<String>("", "version") {
+            Ok(version) if !version.is_empty() => version,
+            _ => continue,
+        };
+
+        let name = row
+            .try_get::<String>("", "name")
+            .ok()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| version.clone());
+        let applied_at = row
+            .try_get::<String>("", "applied_at")
+            .ok()
+            .filter(|value| !value.is_empty());
+
+        let mut migration = all_by_name.get(&version).cloned().unwrap_or(Migration {
+            file_name: version.clone(),
+            version: version.clone(),
+            name,
+            up_sql: String::new(),
+            down_sql: String::new(),
+            applied_at: None,
+        });
+
+        if migration.name.is_empty() {
+            migration.name = version.clone();
+        }
+
+        migration.applied_at = applied_at;
+        migrations.push(migration);
+    }
+
+    Ok(migrations)
+}
+
+fn migration_records_query(config: &TideConfig, table_name: &str) -> String {
+    let table = quoted_identifier(config, table_name);
+    let version = quoted_identifier(config, "version");
+    let name = quoted_identifier(config, "name");
+    let applied_at = quoted_identifier(config, "applied_at");
+    let applied_at_expr = match config.database.driver.as_str() {
+        "mysql" => format!("CAST({} AS CHAR) AS {}", applied_at, applied_at),
+        _ => format!("CAST({} AS TEXT) AS {}", applied_at, applied_at),
+    };
+
+    format!(
+        "SELECT {}, {}, {} FROM {} ORDER BY {} ASC",
+        version, name, applied_at_expr, table, version
+    )
 }
 
 /// Find a specific migration
@@ -578,8 +639,44 @@ fn find_migration(migrations_path: &str, name: &str) -> Result<Migration, String
 
     migrations
         .into_iter()
-        .find(|m| m.name.contains(name))
+        .find(|migration| {
+            migration.file_name.contains(name)
+                || migration.version.contains(name)
+                || migration.name.contains(name)
+        })
         .ok_or_else(|| format!("Migration not found: {}", name))
+}
+
+fn parse_migration_metadata(file_name: &str, content: &str) -> (String, String) {
+    let version_pattern = regex::Regex::new(r#"fn\s+version\s*\([^)]*\)\s*->\s*&str\s*\{\s*\"([^\"]+)\""#)
+        .unwrap();
+    let name_pattern = regex::Regex::new(r#"fn\s+name\s*\([^)]*\)\s*->\s*&str\s*\{\s*\"([^\"]+)\""#)
+        .unwrap();
+
+    let version = version_pattern
+        .captures(content)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().to_string())
+        .or_else(|| split_file_name(file_name).map(|(version, _)| version.to_string()))
+        .unwrap_or_else(|| file_name.to_string());
+
+    let logical_name = name_pattern
+        .captures(content)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().to_string())
+        .or_else(|| split_file_name(file_name).map(|(_, name)| name.to_string()))
+        .unwrap_or_else(|| file_name.to_string());
+
+    (version, logical_name)
+}
+
+fn split_file_name(file_name: &str) -> Option<(&str, &str)> {
+    let (version, name) = file_name.split_once('_')?;
+    if version.chars().all(|character| character.is_ascii_digit()) {
+        Some((version, name))
+    } else {
+        None
+    }
 }
 
 /// Parse migration file content to extract up/down SQL
@@ -587,16 +684,15 @@ fn parse_migration_content(content: &str) -> (String, String) {
     let mut up_sql = String::new();
     let mut down_sql = String::new();
 
-    // Look for SQL in string literals within up() and down() methods
     let up_pattern = regex::Regex::new(r#"fn\s+up\s*\([^)]*\)[^{]*\{([\s\S]*?)\n\s*\}"#).unwrap();
     let down_pattern = regex::Regex::new(r#"fn\s+down\s*\([^)]*\)[^{]*\{([\s\S]*?)\n\s*\}"#).unwrap();
 
-    if let Some(cap) = up_pattern.captures(content) {
-        up_sql = extract_sql_from_method(&cap[1]);
+    if let Some(captures) = up_pattern.captures(content) {
+        up_sql = extract_sql_from_method(&captures[1]);
     }
 
-    if let Some(cap) = down_pattern.captures(content) {
-        down_sql = extract_sql_from_method(&cap[1]);
+    if let Some(captures) = down_pattern.captures(content) {
+        down_sql = extract_sql_from_method(&captures[1]);
     }
 
     (up_sql, down_sql)
@@ -604,36 +700,289 @@ fn parse_migration_content(content: &str) -> (String, String) {
 
 /// Extract SQL from method body
 fn extract_sql_from_method(method_body: &str) -> String {
-    let sql_pattern = regex::Regex::new(r##"r#?"([^"]*)"#?"##).unwrap();
+    let sql_pattern = regex::Regex::new(r##"r#?\"([^\"]*)\"#?"##).unwrap();
     let mut sqls = Vec::new();
 
-    for cap in sql_pattern.captures_iter(method_body) {
-        sqls.push(cap[1].to_string());
+    for captures in sql_pattern.captures_iter(method_body) {
+        sqls.push(captures[1].to_string());
     }
 
     sqls.join("\n")
 }
 
 /// Run a migration up
-async fn run_migration_up(_config: &TideConfig, _migration: &Migration) -> Result<(), String> {
-    // TODO: Execute the migration SQL against the database
-    // For now, simulate success
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    Ok(())
+async fn run_migration_up(config: &TideConfig, migration: &Migration) -> Result<(), String> {
+    let up_sql = migration.up_sql.trim();
+    if up_sql.is_empty() {
+        return Err(format!(
+            "Migration {} does not contain executable SQL in up()",
+            migration.file_name
+        ));
+    }
+
+    let db = runtime_db::connect(config).await?;
+    runtime_db::ensure_migration_table_on_db(&db, config, &config.migration.table).await?;
+    let up_sql = up_sql.to_string();
+    let insert_sql = format!(
+        "INSERT INTO {} ({}, {}) VALUES ({}, {})",
+        quoted_identifier(config, &config.migration.table),
+        quoted_identifier(config, "version"),
+        quoted_identifier(config, "name"),
+        sql_string(&migration.version),
+        sql_string(&migration.name)
+    );
+
+    db.transaction(|tx| {
+        Box::pin(async move {
+            execute_on_transaction(tx.connection(), &up_sql).await?;
+            execute_on_transaction(tx.connection(), &insert_sql).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Run a migration down
-async fn run_migration_down(_config: &TideConfig, _migration: &Migration) -> Result<(), String> {
-    // TODO: Execute the migration SQL against the database
-    // For now, simulate success
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    Ok(())
+async fn run_migration_down(config: &TideConfig, migration: &Migration) -> Result<(), String> {
+    let down_sql = migration.down_sql.trim();
+    if down_sql.is_empty() {
+        return Err(format!(
+            "Migration {} does not contain executable SQL in down()",
+            migration.file_name
+        ));
+    }
+
+    let db = runtime_db::connect(config).await?;
+    runtime_db::ensure_migration_table_on_db(&db, config, &config.migration.table).await?;
+    let down_sql = down_sql.to_string();
+    let delete_sql = format!(
+        "DELETE FROM {} WHERE {} = {}",
+        quoted_identifier(config, &config.migration.table),
+        quoted_identifier(config, "version"),
+        sql_string(&migration.version)
+    );
+
+    db.transaction(|tx| {
+        Box::pin(async move {
+            execute_on_transaction(tx.connection(), &down_sql).await?;
+            execute_on_transaction(tx.connection(), &delete_sql).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Drop all tables in the database
-async fn drop_all_tables(_config: &TideConfig) -> Result<(), String> {
-    // TODO: Drop all tables from the database
-    // For now, simulate success
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    Ok(())
+async fn drop_all_tables(config: &TideConfig) -> Result<(), String> {
+    runtime_db::wipe_tables(config, true).await
+}
+
+async fn execute_on_transaction<C>(connection: &C, sql: &str) -> tideorm::Result<()>
+where
+    C: ConnectionTrait,
+{
+    connection
+        .execute_unprepared(sql)
+        .await
+        .map(|_| ())
+        .map_err(|error| tideorm::Error::query(error.to_string()))
+}
+
+fn quoted_identifier(config: &TideConfig, identifier: &str) -> String {
+    match config.database.driver.as_str() {
+        "mysql" => format!("`{}`", identifier.replace('`', "``")),
+        _ => format!("\"{}\"", identifier.replace('"', "\"\"")),
+    }
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_pending_migrations, get_ran_migrations, run, run_migration_down};
+    use crate::config::TideConfig;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn run_tracks_applied_migrations_and_skips_them_later() {
+        let fixture = TestProject::new();
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("first migration run should succeed");
+
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let ran = get_ran_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("ran migrations should load");
+        let pending = get_pending_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("pending migrations should load");
+
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].version, "20260321171859");
+        assert_eq!(ran[0].file_name, "20260321171859_create_users_table");
+        assert!(pending.is_empty());
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("second migration run should succeed");
+
+        let pending_after_second_run = get_pending_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("pending migrations should still be empty");
+        assert!(pending_after_second_run.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_migration_record() {
+        let fixture = TestProject::new();
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("migration run should succeed");
+
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let ran = get_ran_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("ran migrations should load");
+
+        run_migration_down(&config, &ran[0])
+            .await
+            .expect("rollback should succeed");
+
+        let ran_after_rollback = get_ran_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("ran migrations should load after rollback");
+        let pending_after_rollback = get_pending_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("pending migrations should load after rollback");
+
+        assert!(ran_after_rollback.is_empty());
+        assert_eq!(pending_after_rollback.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_ran_migrations_reads_metadata_rows_like_library_migrator() {
+        let fixture = TestProject::new();
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+
+        crate::runtime_db::ensure_migration_table(&config, &config.migration.table)
+            .await
+            .expect("migration table should be created");
+        crate::runtime_db::execute(
+            &config,
+            "INSERT INTO \"_migrations\" (\"version\", \"name\") VALUES ('20260321171859', 'create_users_table')",
+        )
+        .await
+        .expect("migration row should be inserted");
+
+        let ran = get_ran_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("ran migrations should load");
+
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].version, "20260321171859");
+        assert_eq!(ran[0].name, "create_users_table");
+        assert!(ran[0].applied_at.is_some());
+    }
+
+    struct TestProject {
+        _dir: TempDir,
+        config_path: String,
+        migrations_path: String,
+    }
+
+    impl TestProject {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("temp dir should be created");
+            let root = dir.path();
+            let migrations_dir = root.join("src").join("migrations");
+            fs::create_dir_all(&migrations_dir).expect("migrations directory should be created");
+
+            let database_path = slash_path(root.join("test.sqlite3"));
+            let config_path = root.join("tideorm.toml");
+            let migrations_path = slash_path(&migrations_dir);
+            let models_path = slash_path(root.join("src").join("models"));
+            let seeders_path = slash_path(root.join("src").join("seeders"));
+            let factories_path = slash_path(root.join("src").join("factories"));
+            let config_file_path = slash_path(root.join("src").join("config.rs"));
+
+            let config_contents = format!(
+                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"{}\"\nmodels = \"{}\"\nseeders = \"{}\"\nfactories = \"{}\"\nconfig_file = \"{}\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[seeder]\ndefault_seeder = \"DatabaseSeeder\"\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
+                database_path,
+                migrations_path,
+                models_path,
+                seeders_path,
+                factories_path,
+                config_file_path
+            );
+            fs::write(&database_path, b"").expect("database file should be created");
+            fs::write(&config_path, config_contents).expect("config should be written");
+
+            fs::write(migrations_dir.join("mod.rs"), "//! Database migrations\n")
+                .expect("mod.rs should be written");
+            fs::write(
+                migrations_dir.join("20260321171859_create_users_table.rs"),
+                TEST_MIGRATION,
+            )
+            .expect("migration should be written");
+
+            Self {
+                _dir: dir,
+                config_path: slash_path(config_path),
+                migrations_path,
+            }
+        }
+
+        fn config_path(&self) -> &str {
+            &self.config_path
+        }
+
+        fn migrations_path(&self) -> &str {
+            &self.migrations_path
+        }
+    }
+
+    fn slash_path(path: impl AsRef<std::path::Path>) -> String {
+        path.as_ref().to_string_lossy().replace('\\', "/")
+    }
+
+    const TEST_MIGRATION: &str = r##"//! Migration: create_users_table
+
+use tideorm::prelude::*;
+
+pub struct CreateUsersTable;
+
+#[async_trait]
+impl Migration for CreateUsersTable {
+    fn version(&self) -> &str {
+        "20260321171859"
+    }
+
+    fn name(&self) -> &str {
+        "create_users_table"
+    }
+
+    async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {
+        schema.raw(r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        "#).await?;
+        Ok(())
+    }
+
+    async fn down(&self, schema: &mut Schema) -> tideorm::Result<()> {
+        schema.raw(r#"DROP TABLE IF EXISTS users"#).await?;
+        Ok(())
+    }
+}
+"##;
 }

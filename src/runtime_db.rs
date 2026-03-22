@@ -6,6 +6,8 @@ use std::path::Path;
 use tideorm::internal::{ConnectionTrait, Statement};
 use tideorm::prelude::Database;
 
+pub const DEFAULT_SEEDERS_TABLE: &str = "_seeders";
+
 #[derive(Debug, Clone)]
 pub struct ColumnDetails {
     pub name: String,
@@ -31,6 +33,11 @@ pub struct ForeignKeyDetails {
 }
 
 pub async fn connect(config: &TideConfig) -> Result<Database, String> {
+    if normalized_driver(config) == "sqlite" {
+        let sqlite_path = config.database.sqlite_path.as_deref().unwrap_or("database.db");
+        create_database(config, sqlite_path).await?;
+    }
+
     Database::connect(&config.database.connection_url())
         .await
         .map_err(|error| error.to_string())
@@ -304,6 +311,45 @@ pub async fn create_database(config: &TideConfig, database_name: &str) -> Result
         }
         driver => Err(format!("Unsupported database driver: {}", driver)),
     }
+}
+
+pub async fn ensure_metadata_tables(
+    config: &TideConfig,
+    migration_table: &str,
+) -> Result<(), String> {
+    let db = connect(config).await?;
+    ensure_metadata_tables_on_db(&db, config, migration_table).await
+}
+
+pub async fn ensure_metadata_tables_on_db(
+    db: &Database,
+    config: &TideConfig,
+    migration_table: &str,
+) -> Result<(), String> {
+    ensure_migration_table_on_db(db, config, migration_table).await?;
+    ensure_seeders_table_on_db(db, config).await
+}
+
+pub async fn ensure_migration_table(
+    config: &TideConfig,
+    migration_table: &str,
+) -> Result<(), String> {
+    let db = connect(config).await?;
+    ensure_migration_table_on_db(&db, config, migration_table).await
+}
+
+pub async fn ensure_migration_table_on_db(
+    db: &Database,
+    config: &TideConfig,
+    migration_table: &str,
+) -> Result<(), String> {
+    execute_on_db(db, &metadata_table_sql(config, migration_table, true)).await?;
+    Ok(())
+}
+
+pub async fn ensure_seeders_table_on_db(db: &Database, config: &TideConfig) -> Result<(), String> {
+    execute_on_db(db, &metadata_table_sql(config, DEFAULT_SEEDERS_TABLE, false)).await?;
+    Ok(())
 }
 
 pub async fn drop_database(config: &TideConfig, database_name: &str) -> Result<(), String> {
@@ -612,6 +658,54 @@ fn quoted_identifier(config: &TideConfig, identifier: &str) -> String {
     match normalized_driver(config) {
         "mysql" => format!("`{}`", identifier.replace('`', "``")),
         _ => format!("\"{}\"", identifier.replace('"', "\"\"")),
+    }
+}
+
+fn metadata_table_sql(config: &TideConfig, table_name: &str, include_version: bool) -> String {
+    let id = quoted_identifier(config, "id");
+    let name = quoted_identifier(config, "name");
+    let applied_at = quoted_identifier(config, "applied_at");
+    let table = quoted_identifier(config, table_name);
+    let version_column = if include_version {
+        format!(", {} {} NOT NULL UNIQUE", quoted_identifier(config, "version"), metadata_text_type(config))
+    } else {
+        String::new()
+    };
+
+    match normalized_driver(config) {
+        "mysql" => format!(
+            "CREATE TABLE IF NOT EXISTS {} ({} INT AUTO_INCREMENT PRIMARY KEY{}, {} {} NOT NULL UNIQUE, {} TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            table,
+            id,
+            version_column,
+            name,
+            metadata_text_type(config),
+            applied_at,
+        ),
+        "sqlite" => format!(
+            "CREATE TABLE IF NOT EXISTS {} ({} INTEGER PRIMARY KEY AUTOINCREMENT{}, {} TEXT NOT NULL UNIQUE, {} TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            table,
+            id,
+            version_column,
+            name,
+            applied_at,
+        ),
+        _ => format!(
+            "CREATE TABLE IF NOT EXISTS {} ({} SERIAL PRIMARY KEY{}, {} {} NOT NULL UNIQUE, {} TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            table,
+            id,
+            version_column,
+            name,
+            metadata_text_type(config),
+            applied_at,
+        ),
+    }
+}
+
+fn metadata_text_type(config: &TideConfig) -> &'static str {
+    match normalized_driver(config) {
+        "sqlite" => "TEXT",
+        _ => "VARCHAR(255)",
     }
 }
 

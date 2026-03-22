@@ -14,6 +14,7 @@ pub async fn handle(config_path: &str, cmd: DbCommands, verbose: bool) -> Result
         DbCommands::Seed { seeder, force } => seed(config_path, seeder, force, verbose).await,
         DbCommands::Fresh { force } => fresh(config_path, force, verbose).await,
         DbCommands::Status => status(config_path, verbose).await,
+        DbCommands::Check => check(config_path, verbose).await,
         DbCommands::Create { name } => create_database(config_path, name, verbose).await,
         DbCommands::Drop { name, force } => drop_database(config_path, name, force, verbose).await,
         DbCommands::Wipe { drop_types, force } => wipe(config_path, drop_types, force, verbose).await,
@@ -159,6 +160,29 @@ async fn status(config_path: &str, verbose: bool) -> Result<(), String> {
 
     println!("{}", "─".repeat(50));
 
+    Ok(())
+}
+
+/// Initialize TideORM metadata tables for the current database
+async fn check(config_path: &str, verbose: bool) -> Result<(), String> {
+    let config = TideConfig::load(config_path)?;
+
+    if verbose {
+        print_info("Initializing TideORM metadata tables...");
+    }
+
+    runtime_db::ensure_metadata_tables(&config, &config.migration.table).await?;
+
+    println!("\n{}", "Database Metadata:".cyan().bold());
+    println!("{}", "─".repeat(50));
+    println!("  Migration table: {}", config.migration.table.green());
+    println!(
+        "  Seeder table:    {}",
+        runtime_db::DEFAULT_SEEDERS_TABLE.green()
+    );
+    println!("{}", "─".repeat(50));
+
+    print_success("TideORM metadata tables are ready");
     Ok(())
 }
 
@@ -431,4 +455,68 @@ async fn get_table_columns(config: &TideConfig, table_name: &str) -> Result<Vec<
 /// Get all tables
 async fn get_all_tables(config: &TideConfig) -> Result<Vec<String>, String> {
     runtime_db::list_tables(config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check;
+    use crate::config::TideConfig;
+    use crate::runtime_db;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn check_creates_metadata_tables_for_sqlite() {
+        let fixture = TempDbProject::new();
+
+        check(fixture.config_path(), false)
+            .await
+            .expect("check should initialize metadata tables");
+
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let tables = runtime_db::list_tables(&config)
+            .await
+            .expect("tables should be listed");
+
+        assert!(tables.iter().any(|table| table == "_migrations"));
+        assert!(
+            tables
+                .iter()
+                .any(|table| table == runtime_db::DEFAULT_SEEDERS_TABLE)
+        );
+    }
+
+    struct TempDbProject {
+        _dir: TempDir,
+        config_path: String,
+    }
+
+    impl TempDbProject {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("temp dir should be created");
+            let root = dir.path();
+            let db_path = slash_path(root.join("check.sqlite3"));
+            let config_path = root.join("tideorm.toml");
+
+            let config_contents = format!(
+                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"src/migrations\"\nmodels = \"src/models\"\nseeders = \"src/seeders\"\nfactories = \"src/factories\"\nconfig_file = \"src/config.rs\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[seeder]\ndefault_seeder = \"DatabaseSeeder\"\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
+                db_path,
+            );
+
+            fs::write(&config_path, config_contents).expect("config should be written");
+
+            Self {
+                _dir: dir,
+                config_path: slash_path(config_path),
+            }
+        }
+
+        fn config_path(&self) -> &str {
+            &self.config_path
+        }
+    }
+
+    fn slash_path(path: impl AsRef<std::path::Path>) -> String {
+        path.as_ref().to_string_lossy().replace('\\', "/")
+    }
 }
