@@ -1,9 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
-- Track TideORM `0.10.0`. That release is breaking for library users; the CLI's own commands and
-  flags are unchanged, so the CLI version stays `0.8.8`.
+Breaking: the web UI is gone and the CLI is commands-only.
+
+- **Removed `tideorm ui` and `tideorm studio`** (TideORM Studio) along with `src/ui/`, the clap
+  variants and their dispatch, and the `tiny_http` dependency. Its `/api/execute` endpoint shelled
+  out to the CLI binary with caller-supplied argv, so the surface goes with it. If you scripted
+  either command there is no replacement — drive the equivalent `tideorm` subcommands directly.
+  This is what moves the minor version rather than the patch.
+- Dropped four unused dependencies (`indicatif`, `console`, `walkdir`, dev-dep `predicates`) and
+  narrowed `tokio` from `full` to the features actually used. With `tiny_http` that removes 25
+  packages from the lockfile.
+- Destructive-command safety: `db drop` gained the production guard every sibling already had;
+  `db create`/`db drop` honour `--name` on SQLite instead of silently acting on the configured
+  `sqlite_path`; `migrate fresh` validates the migration set before dropping any tables and refuses
+  up front when `--seed` cannot run; `migrate up` no longer hardcodes `force = true`, and
+  `up`/`down`/`redo` gained `--force`; a cancelled confirmation no longer exits `0`.
+- Correctness: migration SQL runs one statement at a time and the extractor no longer truncates at
+  a double-quoted identifier; rollback orders by application order rather than version string;
+  `migrate mark` reconciles the ledger for backends that commit DDL implicitly; integers no longer
+  decode as booleans; generators emit compilable code.
+- Added `.github/workflows/ci.yml` — fmt, clippy and tests. The CLI is not standalone, so the lint
+  and test jobs check out the sibling ORM and recreate the `path` override developers run with
+  locally; the committed manifest keeps taking `tideorm` from the registry.
+- Track TideORM `0.10.0`.
 - Bump the `tideorm` version pinned into every scaffolded project's `Cargo.toml` from `0.9.19` to
   `0.10.0` (`SCAFFOLD_TIDEORM_VERSION` in `src/commands/init.rs`, the single source the template
   and its test both read).
