@@ -1,17 +1,44 @@
 //! Seeder generator for TideORM CLI
 
 use crate::config::TideConfig;
-use crate::utils::{ensure_directory, to_snake_case};
+use crate::utils::{
+    crate_module_path, ensure_directory, ensure_writable, escape_ident, to_snake_case,
+};
 
 /// Seeder generator
 pub struct SeederGenerator<'a> {
     config: &'a TideConfig,
+    output_dir: Option<String>,
 }
 
 impl<'a> SeederGenerator<'a> {
     /// Create a new seeder generator
     pub fn new(config: &'a TideConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            output_dir: None,
+        }
+    }
+
+    /// Override the directory seeders are written to (the `--output` flag).
+    ///
+    /// `None` keeps the configured `[paths] seeders` directory.
+    ///
+    /// This only moves the generated file: the model import is still derived from
+    /// `[paths] models`, so relocating a seeder does not break it.
+    pub fn output_dir(mut self, dir: Option<&str>) -> Self {
+        self.output_dir = dir
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(ToOwned::to_owned);
+        self
+    }
+
+    /// Directory the generated seeder and its `mod.rs` belong to.
+    fn seeders_dir(&self) -> &str {
+        self.output_dir
+            .as_deref()
+            .unwrap_or(&self.config.paths.seeders)
     }
 
     /// Generate a seeder file
@@ -21,7 +48,7 @@ impl<'a> SeederGenerator<'a> {
         model: Option<String>,
         count: u32,
     ) -> Result<String, String> {
-        ensure_directory(&self.config.paths.seeders)?;
+        ensure_directory(self.seeders_dir())?;
 
         let seeder_name = if name.ends_with("Seeder") {
             to_pascal_case(name)
@@ -30,13 +57,15 @@ impl<'a> SeederGenerator<'a> {
         };
 
         let file_name = format!("{}.rs", to_snake_case(&seeder_name));
-        let file_path = format!("{}/{}", self.config.paths.seeders, file_name);
+        let file_path = format!("{}/{}", self.seeders_dir(), file_name);
 
         let content = if let Some(model_name) = model {
             self.generate_model_seeder(&seeder_name, &model_name, count)
         } else {
             self.generate_basic_seeder(&seeder_name)
         };
+
+        ensure_writable(&file_path)?;
 
         std::fs::write(&file_path, content)
             .map_err(|e| format!("Failed to write seeder file: {}", e))?;
@@ -48,9 +77,16 @@ impl<'a> SeederGenerator<'a> {
     }
 
     /// Generate a seeder for a specific model
+    ///
+    /// The model is imported through the configured `[paths] models` directory rather than
+    /// a hardcoded `crate::models`, so a project that keeps its models elsewhere still gets
+    /// a seeder that compiles.
     fn generate_model_seeder(&self, seeder_name: &str, model_name: &str, count: u32) -> String {
         let model_snake = to_snake_case(model_name);
         let model_pascal = to_pascal_case(model_name);
+        let model_module = escape_ident(&model_snake);
+        let models_path = crate_module_path(&self.config.paths.models);
+        let factories_path = crate_module_path(&self.config.paths.factories);
 
         format!(
             r#"//! {} Seeder
@@ -58,7 +94,7 @@ impl<'a> SeederGenerator<'a> {
 //! Seeds the database with {} records.
 
 use tideorm::prelude::*;
-use crate::models::{model_snake}::{model_pascal};
+use {models_path}::{model_module}::{model_pascal};
 
 /// {} seeder
 #[derive(Default)]
@@ -97,7 +133,7 @@ impl {seeder_name} {{
 
         // TODO: Use factory pattern
         // Example:
-        // crate::factories::{model_snake}_factory::{model_pascal}Factory::create_many({count}).await?;
+        // {factories_path}::{model_snake}_factory::{model_pascal}Factory::create_many({count}).await?;
 
         Self::default().run(db()).await
     }}
@@ -121,6 +157,9 @@ mod tests {{
             seeder_name = seeder_name,
             model_pascal = model_pascal,
             model_snake = model_snake,
+            model_module = model_module,
+            models_path = models_path,
+            factories_path = factories_path,
             count = count,
         )
     }
@@ -186,7 +225,7 @@ mod tests {{
 
     /// Update mod.rs with new seeder
     fn update_mod_file(&self, seeder_name: &str) -> Result<(), String> {
-        let mod_path = format!("{}/mod.rs", self.config.paths.seeders);
+        let mod_path = format!("{}/mod.rs", self.seeders_dir());
         let module_name = to_snake_case(seeder_name);
 
         let existing = std::fs::read_to_string(&mod_path).unwrap_or_default();
@@ -223,5 +262,38 @@ mod tests {
 
         assert!(content.contains("Self::default().run(db()).await"));
         assert!(!content.contains("run(&db())"));
+    }
+
+    #[test]
+    fn model_seeder_imports_from_the_configured_models_path() {
+        let mut config = TideConfig::default();
+        let generator = SeederGenerator::new(&config);
+        let content = generator.generate_model_seeder("UserSeeder", "User", 10);
+        assert!(content.contains("use crate::models::user::User;"));
+
+        config.paths.models = "src/domain/models".to_string();
+        config.paths.factories = "src/domain/factories".to_string();
+        let generator = SeederGenerator::new(&config);
+        let content = generator.generate_model_seeder("UserSeeder", "User", 10);
+
+        assert!(content.contains("use crate::domain::models::user::User;"));
+        assert!(!content.contains("use crate::models::"));
+        assert!(content.contains("// crate::domain::factories::user_factory::UserFactory"));
+    }
+
+    #[test]
+    fn seeder_output_dir_overrides_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("custom").to_string_lossy().into_owned();
+
+        let mut config = TideConfig::default();
+        config.paths.seeders = dir.path().join("configured").to_string_lossy().into_owned();
+
+        let path = SeederGenerator::new(&config)
+            .output_dir(Some(&output))
+            .generate("Demo", None, 1)
+            .unwrap();
+
+        assert!(path.starts_with(&output), "{}", path);
     }
 }

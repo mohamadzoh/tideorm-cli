@@ -2,7 +2,9 @@
 
 use crate::config::TideConfig;
 use crate::runtime_db;
-use crate::utils::{confirm, ensure_directory, file_exists, print_info, print_success, print_warning};
+use crate::utils::{
+    confirm, ensure_directory, file_exists, print_info, print_success, print_warning,
+};
 use colored::Colorize;
 use dialoguer::{Input, Password};
 use std::collections::VecDeque;
@@ -11,6 +13,12 @@ use std::sync::{LazyLock, Mutex};
 
 static PROMPT_SCRIPT: LazyLock<Mutex<Option<VecDeque<String>>>> =
     LazyLock::new(|| Mutex::new(None));
+
+/// Version of the `tideorm` crate pinned into every scaffolded `Cargo.toml`.
+///
+/// Single source of truth: the template and its test both read this, so they cannot drift
+/// apart. Bump it alongside a `tideorm` release.
+const SCAFFOLD_TIDEORM_VERSION: &str = "0.10.0";
 
 /// Initialize a new TideORM project
 pub async fn run(name: &str, database: &str, verbose: bool) -> Result<(), String> {
@@ -50,7 +58,7 @@ pub async fn run(name: &str, database: &str, verbose: bool) -> Result<(), String
     }
 
     create_project_structure(verbose)?;
-    create_scaffold_files(&project_path, init_options.database.driver())?;
+    create_scaffold_files(&project_path, &init_options)?;
 
     if should_write_project_config && init_options.create_database_now {
         create_database_from_config("tideorm.toml", &init_options, verbose).await?;
@@ -61,7 +69,10 @@ pub async fn run(name: &str, database: &str, verbose: bool) -> Result<(), String
     }
 
     println!("{}", "─".repeat(50));
-    println!("\n{}", "✓ TideORM project initialized successfully!".green().bold());
+    println!(
+        "\n{}",
+        "✓ TideORM project initialized successfully!".green().bold()
+    );
 
     print_next_steps(&init_options, should_write_project_config);
 
@@ -93,6 +104,8 @@ struct InitOptions {
     env_file_name: String,
     overwrite_config: bool,
     database: DatabaseInit,
+    /// Whether a `DATABASE_URL` already present in the env file may be replaced.
+    replace_database_url: bool,
     create_database_now: bool,
     run_migrations_now: bool,
 }
@@ -164,9 +177,14 @@ impl DatabaseInit {
 }
 
 fn collect_init_options(database: &str, verbose: bool) -> Result<InitOptions, String> {
-    let running_under_rust_tests = cfg!(test) || std::env::var_os("RUST_TEST_THREADS").is_some();
-    let forced_noninteractive = std::env::var_os("TIDEORM_NONINTERACTIVE").is_some()
-        || std::env::var_os("CI").is_some();
+    reset_prompt_script();
+
+    // `RUST_TEST_THREADS` is exported globally by plenty of developers, and treating it as
+    // "this is a test run" silently turned a real interactive `init` into all-defaults.
+    // Only an actual test build, or an explicit opt-out, counts.
+    let running_under_rust_tests = cfg!(test);
+    let forced_noninteractive =
+        std::env::var_os("TIDEORM_NONINTERACTIVE").is_some() || std::env::var_os("CI").is_some();
     let interactive = has_prompt_script()
         || (!running_under_rust_tests
             && !forced_noninteractive
@@ -197,6 +215,25 @@ fn collect_init_options(database: &str, verbose: bool) -> Result<InitOptions, St
         "sqlite" => collect_sqlite_options(interactive)?,
         "mysql" => collect_mysql_options(interactive)?,
         _ => collect_postgres_options(interactive)?,
+    };
+
+    // `tideorm init` is routinely re-run inside an existing checkout, and the env file has
+    // no backup: an already-configured DATABASE_URL is only replaced when the user says
+    // so, and never in a non-interactive run.
+    let env_path = std::path::Path::new(&env_file_name);
+    let existing_database_url = read_env_value(env_path, "DATABASE_URL")?;
+    let replace_database_url = match existing_database_url {
+        Some(existing) if !existing.trim().is_empty() && existing != database.connection_url() => {
+            if interactive {
+                prompt_confirm(&format!(
+                    "{} already defines DATABASE_URL. Replace it with the answers above?",
+                    env_file_name
+                ))?
+            } else {
+                false
+            }
+        }
+        _ => true,
     };
 
     let create_database_now = match &database {
@@ -233,6 +270,7 @@ fn collect_init_options(database: &str, verbose: bool) -> Result<InitOptions, St
         env_file_name,
         overwrite_config,
         database,
+        replace_database_url,
         create_database_now,
         run_migrations_now,
     })
@@ -382,8 +420,23 @@ fn parse_prompt_confirm(prompt: &str, value: &str) -> Result<bool, String> {
     }
 }
 
+/// Whether the scripted-answer test hook is active.
+///
+/// `TIDEORM_PROMPT_SCRIPT` short-circuits every interactivity check, so it is confined to
+/// builds with debug assertions on (which is what the test binaries are). A released
+/// binary ignores the variable entirely.
 fn has_prompt_script() -> bool {
-    std::env::var_os("TIDEORM_PROMPT_SCRIPT").is_some()
+    cfg!(debug_assertions) && std::env::var_os("TIDEORM_PROMPT_SCRIPT").is_some()
+}
+
+/// Drop any answers left over from a previous `run()` in this process.
+///
+/// The queue is filled lazily from the environment and never emptied on its own, so a
+/// second in-process `init` would otherwise fail with "ran out of answers".
+fn reset_prompt_script() {
+    if let Ok(mut script) = PROMPT_SCRIPT.lock() {
+        *script = None;
+    }
 }
 
 fn next_prompt_script_value() -> Result<Option<String>, String> {
@@ -391,7 +444,9 @@ fn next_prompt_script_value() -> Result<Option<String>, String> {
         return Ok(None);
     }
 
-    let mut script = PROMPT_SCRIPT.lock().map_err(|_| "Prompt script lock poisoned".to_string())?;
+    let mut script = PROMPT_SCRIPT
+        .lock()
+        .map_err(|_| "Prompt script lock poisoned".to_string())?;
     if script.is_none() {
         let raw = std::env::var("TIDEORM_PROMPT_SCRIPT").unwrap_or_default();
         let values = raw
@@ -435,8 +490,7 @@ fn print_next_steps(options: &InitOptions, wrote_project_config: bool) {
     println!("  2. Create your first model:");
     println!(
         "     {}",
-        "tideorm make model User --fields=\"name:string,email:string:unique\" --migration"
-            .yellow()
+        "tideorm make model User --fields=\"name:string,email:string:unique\" --migration".yellow()
     );
 
     if options.run_migrations_now {
@@ -467,6 +521,12 @@ fn normalize_database(database: &str) -> &str {
 }
 
 fn write_env_file(options: &InitOptions) -> Result<(), String> {
+    if !options.replace_database_url {
+        let message = format!("Kept existing DATABASE_URL in {}", options.env_file_name);
+        print_warning(&message);
+        return Ok(());
+    }
+
     let env_path = std::path::Path::new(&options.env_file_name);
     let existed = env_path.exists();
     upsert_env_value(env_path, "DATABASE_URL", &options.database.connection_url())?;
@@ -493,7 +553,12 @@ fn write_tideorm_config(options: &InitOptions) -> Result<(), String> {
 }
 
 fn create_project_structure(verbose: bool) -> Result<(), String> {
-    let directories = ["src/models", "src/migrations", "src/seeders", "src/factories"];
+    let directories = [
+        "src/models",
+        "src/migrations",
+        "src/seeders",
+        "src/factories",
+    ];
 
     for dir in directories {
         ensure_directory(dir)?;
@@ -520,7 +585,18 @@ fn create_project_structure(verbose: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn create_scaffold_files(project_path: &std::path::Path, database: &str) -> Result<(), String> {
+fn create_scaffold_files(
+    project_path: &std::path::Path,
+    options: &InitOptions,
+) -> Result<(), String> {
+    let database = options.database.driver();
+
+    if !file_exists(".gitignore") {
+        std::fs::write(".gitignore", generate_gitignore(&options.env_file_name))
+            .map_err(|error| format!("Failed to create .gitignore: {}", error))?;
+        print_success("Created .gitignore");
+    }
+
     if !file_exists("Cargo.toml") {
         let package_name = infer_package_name(project_path);
         let cargo_toml_content = generate_cargo_toml(&package_name, database);
@@ -549,8 +625,11 @@ fn create_scaffold_files(project_path: &std::path::Path, database: &str) -> Resu
         let mod_path = "src/seeders/mod.rs";
         let mod_content = std::fs::read_to_string(mod_path).unwrap_or_default();
         if !mod_content.contains("database_seeder") {
-            std::fs::write(mod_path, format!("{}pub mod database_seeder;\n", mod_content))
-                .map_err(|error| format!("Failed to update mod.rs: {}", error))?;
+            std::fs::write(
+                mod_path,
+                format!("{}pub mod database_seeder;\n", mod_content),
+            )
+            .map_err(|error| format!("Failed to update mod.rs: {}", error))?;
         }
     }
 
@@ -589,7 +668,7 @@ fn generate_tideorm_toml(options: &InitOptions) -> String {
 
 [project]
 name = "my-tideorm-project"
-environment = "development"
+environment = "${{TIDEORM_ENV}}"
 env_file = "{env_file}"
 
 [database]
@@ -635,7 +714,7 @@ primary_key_type = "i64"
 
 [project]
 name = "my-tideorm-project"
-environment = "development"
+environment = "${{TIDEORM_ENV}}"
 env_file = "{env_file}"
 
 [database]
@@ -688,7 +767,7 @@ primary_key_type = "i64"
 
 [project]
 name = "my-tideorm-project"
-environment = "development"
+environment = "${{TIDEORM_ENV}}"
 env_file = "{env_file}"
 
 [database]
@@ -732,6 +811,60 @@ primary_key_type = "i64"
     }
 }
 
+/// Contents of the scaffolded `.gitignore`.
+///
+/// `tideorm init` writes the database password into the env file in plaintext, so that
+/// file - along with the build directory and any local SQLite database - must never be
+/// committed by accident.
+fn generate_gitignore(env_file_name: &str) -> String {
+    let mut content = r#"# Build output
+/target
+
+# Environment files - these hold database credentials in plaintext
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+"#
+    .to_string();
+
+    // `tideorm init` lets the env file be renamed; anything not starting with `.env` is
+    // not covered by the patterns above.
+    if !env_file_name.starts_with(".env") {
+        let extra = format!("\n# Configured environment file\n{}\n", env_file_name);
+        content.push_str(&extra);
+    }
+
+    content
+}
+
+/// Read a single `KEY=value` entry from an env file, if the file has one.
+fn read_env_value(path: &std::path::Path, key: &str) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
+    let prefix = format!("{}=", key);
+
+    for line in content.lines() {
+        let line = line.trim_start();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some(value) = line.strip_prefix(&prefix) {
+            return Ok(Some(value.trim().to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 fn upsert_env_value(path: &std::path::Path, key: &str, value: &str) -> Result<(), String> {
     let entry = format!("{}={}", key, value);
     let existing = if path.exists() {
@@ -745,7 +878,9 @@ fn upsert_env_value(path: &std::path::Path, key: &str, value: &str) -> Result<()
     let mut lines = Vec::new();
     for line in existing.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with(&format!("{}=", key)) || trimmed.starts_with(&format!("export {}=", key)) {
+        if trimmed.starts_with(&format!("{}=", key))
+            || trimmed.starts_with(&format!("export {}=", key))
+        {
             lines.push(entry.clone());
             replaced = true;
         } else {
@@ -774,6 +909,12 @@ fn build_url(
     username: &str,
     password: &str,
 ) -> String {
+    // Credentials are percent-encoded: a password containing `@`, `:`, `/` or `#` would
+    // otherwise close the userinfo component early and corrupt the URL written to the env
+    // file.
+    let username = crate::config::encode_userinfo(username);
+    let password = crate::config::encode_userinfo(password);
+
     if password.is_empty() {
         format!("{}://{}@{}:{}/{}", scheme, username, host, port, database)
     } else {
@@ -797,7 +938,8 @@ fn sqlite_url(path: &str) -> String {
 
 fn generate_config_rs(database: &str) -> String {
     let db_setup = match database {
-        "sqlite" => r#"
+        "sqlite" => {
+            r#"
     // SQLite setup
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://database.db".to_string());
@@ -807,8 +949,10 @@ fn generate_config_rs(database: &str) -> String {
         .database(&database_url)
         .max_connections(5)
         .min_connections(1)
-"#,
-        "mysql" => r#"
+"#
+        }
+        "mysql" => {
+            r#"
     // MySQL setup
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
@@ -818,8 +962,10 @@ fn generate_config_rs(database: &str) -> String {
         .database(&database_url)
         .max_connections(10)
         .min_connections(2)
-"#,
-        _ => r#"
+"#
+        }
+        _ => {
+            r#"
     // PostgreSQL setup
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
@@ -829,7 +975,8 @@ fn generate_config_rs(database: &str) -> String {
         .database(&database_url)
         .max_connections(10)
         .min_connections(2)
-"#,
+"#
+        }
     };
 
     format!(
@@ -894,10 +1041,15 @@ edition = "2024"
 [dependencies]
 tokio = {{ version = "1", features = ["full"] }}
 serde = {{ version = "1", features = ["derive"] }}
+serde_json = "1"
 chrono = "0.4"
-tideorm = {{ version = "0.8.7", features = ["{database_feature}", "runtime-tokio"] }}
+tideorm = {{ version = "{tideorm_version}", default-features = false, features = ["{database_feature}", "runtime-tokio"] }}
+
+[features]
+entity-manager = ["tideorm/entity-manager"]
 "#,
         package_name = package_name,
+        tideorm_version = SCAFFOLD_TIDEORM_VERSION,
         database_feature = database_feature,
     )
 }
@@ -960,23 +1112,32 @@ mod tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_cargo_toml, generate_tideorm_toml, infer_package_name, run, upsert_env_value,
-        DatabaseInit, InitOptions,
+        DatabaseInit, InitOptions, SCAFFOLD_TIDEORM_VERSION, build_url, generate_cargo_toml,
+        generate_gitignore, generate_tideorm_toml, infer_package_name, run, upsert_env_value,
     };
     use std::fs;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::LazyLock;
     use tempfile::TempDir;
 
-    static INIT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    static INIT_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[test]
     fn generated_cargo_toml_uses_current_tideorm_version() {
         let cargo_toml = generate_cargo_toml("demo_app", "sqlite");
 
-        assert!(cargo_toml.contains("tideorm = { version = \"0.8.7\""));
+        assert!(cargo_toml.contains(&format!(
+            "tideorm = {{ version = \"{}\"",
+            SCAFFOLD_TIDEORM_VERSION
+        )));
         assert!(cargo_toml.contains("serde = { version = \"1\", features = [\"derive\"] }"));
+        assert!(cargo_toml.contains("serde_json = \"1\""));
         assert!(cargo_toml.contains("chrono = \"0.4\""));
+        // Without `default-features = false` a non-PostgreSQL project still builds the
+        // PostgreSQL driver, because tideorm's defaults are ["postgres", "runtime-tokio"].
+        assert!(cargo_toml.contains("default-features = false"));
         assert!(cargo_toml.contains("features = [\"sqlite\", \"runtime-tokio\"]"));
+        assert!(cargo_toml.contains("entity-manager = [\"tideorm/entity-manager\"]"));
     }
 
     #[test]
@@ -997,6 +1158,7 @@ mod tests {
                 username: "postgres".to_string(),
                 password: "secret".to_string(),
             },
+            replace_database_url: true,
             create_database_now: false,
             run_migrations_now: false,
         };
@@ -1005,6 +1167,28 @@ mod tests {
         assert!(toml.contains("env_file = \".env.local\""));
         assert!(toml.contains("url = \"${DATABASE_URL}\""));
         assert!(toml.contains("database = \"app_db\""));
+        // The production guards are useless if the scaffold pins the environment to a
+        // literal, so `TIDEORM_ENV` has to be able to reach them.
+        assert!(toml.contains("environment = \"${TIDEORM_ENV}\""));
+    }
+
+    #[test]
+    fn build_url_percent_encodes_credentials() {
+        let url = build_url("postgres", "localhost", 5432, "app", "a@b", "p@ss/w#1");
+
+        assert_eq!(url, "postgres://a%40b:p%40ss%2Fw%231@localhost:5432/app");
+    }
+
+    #[test]
+    fn generated_gitignore_covers_secrets_and_build_output() {
+        let gitignore = generate_gitignore(".env");
+
+        assert!(gitignore.contains("/target"));
+        assert!(gitignore.contains(".env"));
+        assert!(gitignore.contains("*.db"));
+
+        let custom = generate_gitignore("secrets.conf");
+        assert!(custom.contains("secrets.conf"));
     }
 
     #[test]
@@ -1023,7 +1207,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_restores_working_directory() {
-        let _guard = INIT_TEST_LOCK.lock().unwrap();
+        let _guard = INIT_TEST_LOCK.lock().await;
         let workspace = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
         unsafe {
@@ -1045,11 +1229,15 @@ mod tests {
 
     #[tokio::test]
     async fn run_keeps_existing_config_without_mutating_env_file() {
-        let _guard = INIT_TEST_LOCK.lock().unwrap();
+        let _guard = INIT_TEST_LOCK.lock().await;
         let workspace = TempDir::new().unwrap();
         let project_dir = workspace.path().join("existing_project");
         fs::create_dir_all(&project_dir).unwrap();
-        fs::write(project_dir.join("tideorm.toml"), "[project]\nname = \"demo\"\n").unwrap();
+        fs::write(
+            project_dir.join("tideorm.toml"),
+            "[project]\nname = \"demo\"\n",
+        )
+        .unwrap();
         fs::write(project_dir.join(".env"), "DATABASE_URL=preserve-me\n").unwrap();
 
         let original_dir = std::env::current_dir().unwrap();
@@ -1068,5 +1256,41 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(env_contents, "DATABASE_URL=preserve-me\n");
+    }
+
+    /// The unguarded branch: no `tideorm.toml`, so `init` does write the project config,
+    /// but an env file that already carries a working `DATABASE_URL` must survive it.
+    #[tokio::test]
+    async fn run_keeps_existing_database_url_without_tideorm_toml() {
+        let _guard = INIT_TEST_LOCK.lock().await;
+        let workspace = TempDir::new().unwrap();
+        let project_dir = workspace.path().join("adopted_project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join(".env"),
+            "DATABASE_URL=sqlite://existing.db\n",
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        unsafe {
+            std::env::set_var("TIDEORM_NONINTERACTIVE", "1");
+        }
+        std::env::set_current_dir(workspace.path()).unwrap();
+
+        let result = run(project_dir.to_str().unwrap(), "sqlite", false).await;
+        let env_contents = fs::read_to_string(project_dir.join(".env")).unwrap();
+        let gitignore = fs::read_to_string(project_dir.join(".gitignore")).unwrap();
+        let config_exists = project_dir.join("tideorm.toml").exists();
+
+        std::env::set_current_dir(&original_dir).unwrap();
+        unsafe {
+            std::env::remove_var("TIDEORM_NONINTERACTIVE");
+        }
+
+        assert!(result.is_ok(), "init failed: {:?}", result);
+        assert!(config_exists);
+        assert_eq!(env_contents, "DATABASE_URL=sqlite://existing.db\n");
+        assert!(gitignore.contains(".env"));
     }
 }

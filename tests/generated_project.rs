@@ -22,6 +22,20 @@ fn generated_project_builds_after_model_generation() -> Result<(), Box<dyn std::
         .assert()
         .success();
 
+    let tideorm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CLI crate should have a parent directory")
+        .join("tideorm")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut cargo_toml = std::fs::read_to_string(&cargo_toml_path)?;
+    cargo_toml.push_str(&format!(
+        "\n[patch.crates-io]\ntideorm = {{ path = \"{}\" }}\n",
+        tideorm_path
+    ));
+    std::fs::write(&cargo_toml_path, cargo_toml)?;
+
     Command::cargo_bin("tideorm")?
         .current_dir(&project_dir)
         .args([
@@ -113,8 +127,8 @@ fn interactive_init_accepts_scripted_mysql_answers() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn generated_sqlite_project_tracks_migrations_across_repeated_runs(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn generated_sqlite_project_tracks_migrations_across_repeated_runs()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let project_dir = temp_dir.path().join("sqlite_app");
     let project_dir_arg = project_dir.to_string_lossy().into_owned();

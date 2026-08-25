@@ -24,12 +24,16 @@ pub async fn show(config_path: &str, verbose: bool) -> Result<(), String> {
     // Database
     println!("\n{}", "[database]".yellow());
     println!("  driver = \"{}\"", config.database.driver);
-    
+
     match config.database.driver.as_str() {
         "sqlite" => {
             println!(
                 "  sqlite_path = \"{}\"",
-                config.database.sqlite_path.as_deref().unwrap_or("database.db")
+                config
+                    .database
+                    .sqlite_path
+                    .as_deref()
+                    .unwrap_or("database.db")
             );
         }
         _ => {
@@ -46,11 +50,11 @@ pub async fn show(config_path: &str, verbose: bool) -> Result<(), String> {
             println!("  password = \"********\"");
         }
     }
-    
+
     if let Some(url) = &config.database.url {
         println!("  url = \"{}\"", mask_password(url));
     }
-    
+
     println!("  pool_size = {}", config.database.pool_size);
     println!("  timeout = {}", config.database.timeout);
 
@@ -83,14 +87,78 @@ pub async fn show(config_path: &str, verbose: bool) -> Result<(), String> {
 
     // Show connection URL
     println!("\n{}", "Connection URL:".cyan());
-    println!("  {}", mask_password(&config.database.connection_url()));
+    match config.database.try_connection_url() {
+        Ok(url) => println!("  {}", mask_password(&url)),
+        Err(error) => println!("  {}", error.yellow()),
+    }
 
     Ok(())
 }
 
-/// Mask password in connection URL
+/// Mask the password in a connection URL.
+///
+/// The password ends at the *last* `@` of the authority, not the first: a non-greedy match
+/// stops at an `@` inside the password itself and prints the rest of it verbatim. A
+/// password holding an unencoded `/` pushes that `@` past the authority, so the whole URL
+/// is scanned as a fallback rather than leaving the credential on screen.
 fn mask_password(url: &str) -> String {
-    // Match password in URL format: protocol://user:password@host
-    let re = regex::Regex::new(r"://([^:]+):([^@]+)@").unwrap();
-    re.replace(url, "://$1:********@").to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+
+    let userinfo_start = scheme_end + 3;
+    let rest = &url[userinfo_start..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+
+    let at = rest[..authority_end].rfind('@').or_else(|| rest.rfind('@'));
+    let Some(at) = at else {
+        return url.to_string();
+    };
+
+    let Some(colon) = rest[..at].find(':') else {
+        return url.to_string();
+    };
+
+    let head = &url[..userinfo_start + colon];
+    let tail = &rest[at..];
+
+    format!("{}:********{}", head, tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_password;
+
+    #[test]
+    fn masks_a_plain_password() {
+        assert_eq!(
+            mask_password("postgres://user:pass@localhost:5432/db"),
+            "postgres://user:********@localhost:5432/db"
+        );
+    }
+
+    #[test]
+    fn masks_a_password_containing_an_at_sign() {
+        assert_eq!(
+            mask_password("postgres://user:p@ss@localhost:5432/db"),
+            "postgres://user:********@localhost:5432/db"
+        );
+    }
+
+    #[test]
+    fn masks_a_password_containing_an_unencoded_slash() {
+        assert_eq!(
+            mask_password("postgres://user:pa/ss@localhost/db"),
+            "postgres://user:********@localhost/db"
+        );
+    }
+
+    #[test]
+    fn leaves_urls_without_credentials_alone() {
+        assert_eq!(mask_password("sqlite://app.db"), "sqlite://app.db");
+        assert_eq!(
+            mask_password("postgres://user@localhost:5432/db"),
+            "postgres://user@localhost:5432/db"
+        );
+    }
 }

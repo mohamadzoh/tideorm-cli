@@ -1,22 +1,49 @@
 //! Factory generator for TideORM CLI
 
 use crate::config::TideConfig;
-use crate::utils::{ensure_directory, to_snake_case};
+use crate::utils::{
+    crate_module_path, ensure_directory, ensure_writable, escape_ident, to_snake_case,
+};
 
 /// Factory generator
 pub struct FactoryGenerator<'a> {
     config: &'a TideConfig,
+    output_dir: Option<String>,
 }
 
 impl<'a> FactoryGenerator<'a> {
     /// Create a new factory generator
     pub fn new(config: &'a TideConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            output_dir: None,
+        }
+    }
+
+    /// Override the directory factories are written to (the `--output` flag).
+    ///
+    /// `None` keeps the configured `[paths] factories` directory.
+    ///
+    /// This only moves the generated file: the model import is still derived from
+    /// `[paths] models`, so relocating a factory does not break it.
+    pub fn output_dir(mut self, dir: Option<&str>) -> Self {
+        self.output_dir = dir
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(ToOwned::to_owned);
+        self
+    }
+
+    /// Directory the generated factory and its `mod.rs` belong to.
+    fn factories_dir(&self) -> &str {
+        self.output_dir
+            .as_deref()
+            .unwrap_or(&self.config.paths.factories)
     }
 
     /// Generate a factory file
     pub fn generate(&self, name: &str, model: Option<String>) -> Result<String, String> {
-        ensure_directory(&self.config.paths.factories)?;
+        ensure_directory(self.factories_dir())?;
 
         let factory_name = if name.ends_with("Factory") {
             to_pascal_case(name)
@@ -25,13 +52,18 @@ impl<'a> FactoryGenerator<'a> {
         };
 
         let file_name = format!("{}.rs", to_snake_case(&factory_name));
-        let file_path = format!("{}/{}", self.config.paths.factories, file_name);
+        let file_path = format!("{}/{}", self.factories_dir(), file_name);
 
         let model_name = model.unwrap_or_else(|| {
-            factory_name.strip_suffix("Factory").unwrap_or(&factory_name).to_string()
+            factory_name
+                .strip_suffix("Factory")
+                .unwrap_or(&factory_name)
+                .to_string()
         });
 
         let content = self.generate_factory(&factory_name, &model_name);
+
+        ensure_writable(&file_path)?;
 
         std::fs::write(&file_path, content)
             .map_err(|e| format!("Failed to write factory file: {}", e))?;
@@ -43,9 +75,15 @@ impl<'a> FactoryGenerator<'a> {
     }
 
     /// Generate factory content
+    ///
+    /// The model is imported through the configured `[paths] models` directory rather than
+    /// a hardcoded `crate::models`, so a project that keeps its models elsewhere still gets
+    /// a factory that compiles.
     fn generate_factory(&self, factory_name: &str, model_name: &str) -> String {
         let model_pascal = to_pascal_case(model_name);
         let model_snake = to_snake_case(model_name);
+        let model_module = escape_ident(&model_snake);
+        let models_path = crate_module_path(&self.config.paths.models);
 
         format!(
             r#"//! {} Factory
@@ -53,7 +91,7 @@ impl<'a> FactoryGenerator<'a> {
 //! Factory for creating {} instances for testing and seeding.
 
 use tideorm::prelude::*;
-use crate::models::{model_snake}::{model_pascal};
+use {models_path}::{model_module}::{model_pascal};
 
 /// Factory for creating {model_pascal} instances
 pub struct {factory_name};
@@ -139,13 +177,15 @@ mod tests {{
             model_name,
             model_pascal = model_pascal,
             model_snake = model_snake,
+            model_module = model_module,
+            models_path = models_path,
             factory_name = factory_name,
         )
     }
 
     /// Update mod.rs with new factory
     fn update_mod_file(&self, factory_name: &str) -> Result<(), String> {
-        let mod_path = format!("{}/mod.rs", self.config.paths.factories);
+        let mod_path = format!("{}/mod.rs", self.factories_dir());
         let module_name = to_snake_case(factory_name);
 
         let existing = std::fs::read_to_string(&mod_path).unwrap_or_default();
@@ -167,4 +207,41 @@ mod tests {{
 /// Convert string to PascalCase
 fn to_pascal_case(s: &str) -> String {
     heck::AsPascalCase(s).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FactoryGenerator;
+    use crate::config::TideConfig;
+
+    #[test]
+    fn factory_imports_from_the_configured_models_path() {
+        let mut config = TideConfig::default();
+        let generator = FactoryGenerator::new(&config);
+        let content = generator.generate_factory("UserFactory", "User");
+        assert!(content.contains("use crate::models::user::User;"));
+
+        config.paths.models = "src/domain/models".to_string();
+        let generator = FactoryGenerator::new(&config);
+        let content = generator.generate_factory("UserFactory", "User");
+
+        assert!(content.contains("use crate::domain::models::user::User;"));
+        assert!(!content.contains("use crate::models::"));
+    }
+
+    #[test]
+    fn factory_output_dir_overrides_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("custom").to_string_lossy().into_owned();
+
+        let mut config = TideConfig::default();
+        config.paths.factories = dir.path().join("configured").to_string_lossy().into_owned();
+
+        let path = FactoryGenerator::new(&config)
+            .output_dir(Some(&output))
+            .generate("Demo", None)
+            .unwrap();
+
+        assert!(path.starts_with(&output), "{}", path);
+    }
 }

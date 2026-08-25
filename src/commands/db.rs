@@ -1,9 +1,9 @@
 //! Database commands for TideORM CLI
 
+use crate::DbCommands;
 use crate::config::TideConfig;
 use crate::runtime_db;
-use crate::utils::{print_info, print_success, print_warning};
-use crate::DbCommands;
+use crate::utils::{confirm_destructive, print_info, print_success, print_warning};
 use colored::Colorize;
 use std::fs;
 use std::path::Path;
@@ -17,7 +17,9 @@ pub async fn handle(config_path: &str, cmd: DbCommands, verbose: bool) -> Result
         DbCommands::Check => check(config_path, verbose).await,
         DbCommands::Create { name } => create_database(config_path, name, verbose).await,
         DbCommands::Drop { name, force } => drop_database(config_path, name, force, verbose).await,
-        DbCommands::Wipe { drop_types, force } => wipe(config_path, drop_types, force, verbose).await,
+        DbCommands::Wipe { drop_types, force } => {
+            wipe(config_path, drop_types, force, verbose).await
+        }
         DbCommands::Table { name } => show_table(config_path, &name, verbose).await,
         DbCommands::Tables => list_tables(config_path, verbose).await,
     }
@@ -67,7 +69,7 @@ pub async fn seed(
 
     for seeder in &seeders {
         print!("  Seeding: {}... ", seeder.name);
-        
+
         // Run the seeder
         match run_seeder(&config, seeder).await {
             Ok(count) => {
@@ -94,17 +96,29 @@ async fn fresh(config_path: &str, force: bool, verbose: bool) -> Result<(), Stri
         return Err("Cannot run db:fresh in production without --force flag".to_string());
     }
 
+    // db:fresh always re-seeds. Seeding cannot be performed yet, so refuse here
+    // instead of dropping every table and only then aborting on the seeding
+    // step, which would leave the project with an empty, unseeded database.
+    ensure_seeding_supported().map_err(|reason| {
+        format!(
+            "{} Run `tideorm migrate fresh --force` if you only need to drop tables and re-run migrations.",
+            reason
+        )
+    })?;
+
     if verbose {
         print_warning("This will drop all tables and re-run migrations and seeders!");
     }
 
-    // Use migrate:fresh with --seed
+    // Use migrate:fresh with --seed. `force` is forwarded as given: hard coding
+    // `true` here would skip migrate:fresh's own confirmation for a `db fresh`
+    // that was never forced.
     crate::commands::migrate::handle_subcommand(
         config_path,
         crate::MigrateCommands::Fresh {
             seed: true,
             seeder: None,
-            force: true,
+            force,
         },
         verbose,
     )
@@ -123,22 +137,33 @@ async fn status(config_path: &str, verbose: bool) -> Result<(), String> {
     println!("{}", "─".repeat(50));
 
     println!("  Driver:     {}", config.database.driver.green());
-    
+
     match config.database.driver.as_str() {
         "sqlite" => {
-            let path = config.database.sqlite_path.as_deref().unwrap_or("database.db");
+            let path = config
+                .database
+                .sqlite_path
+                .as_deref()
+                .unwrap_or("database.db");
             println!("  Path:       {}", path);
             let exists = Path::new(path).exists();
             println!(
                 "  Status:     {}",
-                if exists { "EXISTS".green() } else { "NOT FOUND".yellow() }
+                if exists {
+                    "EXISTS".green()
+                } else {
+                    "NOT FOUND".yellow()
+                }
             );
         }
         _ => {
             println!("  Host:       {}", config.database.host);
             println!(
                 "  Port:       {}",
-                config.database.port.map_or("default".to_string(), |p| p.to_string())
+                config
+                    .database
+                    .port
+                    .map_or("default".to_string(), |p| p.to_string())
             );
             println!(
                 "  Database:   {}",
@@ -194,17 +219,14 @@ async fn create_database(
 ) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    let db_name = name
-        .as_deref()
-        .or(config.database.database.as_deref())
-        .ok_or("Database name not specified")?;
+    let db_name = resolve_target_database(&config, name.as_deref())?;
 
     if verbose {
         print_info(&format!("Creating database: {}", db_name));
     }
 
     // Create the database
-    create_db(&config, db_name).await?;
+    create_db(&config, &db_name).await?;
 
     print_success(&format!("Database '{}' created successfully", db_name));
 
@@ -220,16 +242,18 @@ async fn drop_database(
 ) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    let db_name = name
-        .as_deref()
-        .or(config.database.database.as_deref())
-        .ok_or("Database name not specified")?;
+    if config.is_production() && !force {
+        return Err("Cannot drop database in production without --force flag".to_string());
+    }
+
+    let db_name = resolve_target_database(&config, name.as_deref())?;
 
     if !force
-        && !crate::utils::confirm(&format!(
+        && !confirm_destructive(&format!(
             "Are you sure you want to drop database '{}' ?",
             db_name
-        )) {
+        ))?
+    {
         print_info("Operation cancelled");
         return Ok(());
     }
@@ -239,14 +263,18 @@ async fn drop_database(
     }
 
     // Drop the database
-    drop_db(&config, db_name).await?;
+    drop_db(&config, &db_name).await?;
 
     print_success(&format!("Database '{}' dropped successfully", db_name));
 
     Ok(())
 }
 
-/// Wipe all tables (truncate)
+/// Wipe all tables by dropping them
+///
+/// This drops every table, schema included - it is not a `TRUNCATE`. The drop
+/// semantics are load bearing: `migrate fresh` goes through the same
+/// `runtime_db::wipe_tables` and relies on them to rebuild from the migrations.
 async fn wipe(
     config_path: &str,
     drop_types: bool,
@@ -259,19 +287,27 @@ async fn wipe(
         return Err("Cannot wipe database in production without --force flag".to_string());
     }
 
-    if !force && !crate::utils::confirm("Are you sure you want to wipe all tables?") {
+    if drop_types && !drop_types_supported(&config) {
+        print_warning(&format!(
+            "--drop-types only applies to PostgreSQL; ignoring it for driver '{}'",
+            config.database.driver
+        ));
+    }
+
+    if !force
+        && !confirm_destructive("Are you sure you want to drop all tables (schema included)?")?
+    {
         print_info("Operation cancelled");
         return Ok(());
     }
 
     if verbose {
-        print_info("Wiping all tables...");
+        print_info("Dropping all tables...");
     }
 
-    // Truncate all tables
     wipe_tables(&config, drop_types).await?;
 
-    print_success("All tables wiped successfully");
+    print_success("All tables dropped successfully");
 
     Ok(())
 }
@@ -359,6 +395,48 @@ pub struct ColumnInfo {
     pub default: Option<String>,
 }
 
+/// Why the CLI cannot execute project seeders on its own.
+const SEED_RUNNER_UNAVAILABLE: &str = "Running Rust seeders requires an application-side seeder runner; the CLI cannot load project seeder modules directly yet.";
+
+/// Check whether seeders can actually be executed.
+///
+/// Seeding is not something the CLI can perform yet, so this always fails. It
+/// exists so that commands which imply seeding can bail out *before* running a
+/// destructive step instead of wiping the database and aborting afterwards.
+pub(crate) fn ensure_seeding_supported() -> Result<(), String> {
+    Err(SEED_RUNNER_UNAVAILABLE.to_string())
+}
+
+/// Resolve the database a `db create` / `db drop` invocation should act on.
+///
+/// For SQLite the database *is* a file, so an explicitly supplied name is the
+/// target file path (relative names resolve against the current directory) and
+/// the configured `sqlite_path` is only the fallback for when no name was
+/// given. Other drivers fall back to the configured database name.
+fn resolve_target_database(config: &TideConfig, name: Option<&str>) -> Result<String, String> {
+    let explicit = name.map(str::trim).filter(|value| !value.is_empty());
+
+    if config.database.driver == "sqlite" {
+        return Ok(explicit
+            .or(config.database.sqlite_path.as_deref())
+            .unwrap_or("database.db")
+            .to_string());
+    }
+
+    explicit
+        .or(config.database.database.as_deref())
+        .map(str::to_string)
+        .ok_or_else(|| "Database name not specified".to_string())
+}
+
+/// Whether `--drop-types` does anything for the configured driver.
+///
+/// Only PostgreSQL has user-defined types for `db wipe` to drop; on the other
+/// backends the flag is inert, so it is reported rather than silently ignored.
+fn drop_types_supported(config: &TideConfig) -> bool {
+    matches!(config.database.driver.as_str(), "postgres" | "postgresql")
+}
+
 /// Get all seeders from the seeders directory
 fn get_all_seeders(seeders_path: &str) -> Result<Vec<Seeder>, String> {
     let path = Path::new(seeders_path);
@@ -369,7 +447,9 @@ fn get_all_seeders(seeders_path: &str) -> Result<Vec<Seeder>, String> {
 
     let mut seeders = Vec::new();
 
-    for entry in fs::read_dir(path).map_err(|e| format!("Failed to read seeders directory: {}", e))? {
+    for entry in
+        fs::read_dir(path).map_err(|e| format!("Failed to read seeders directory: {}", e))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let file_path = entry.path();
 
@@ -408,10 +488,7 @@ fn find_seeder(seeders_path: &str, name: &str) -> Result<Seeder, String> {
 
 /// Run a seeder
 async fn run_seeder(_config: &TideConfig, _seeder: &Seeder) -> Result<u32, String> {
-    Err(
-        "Running Rust seeders requires an application-side seeder runner; the CLI cannot load project seeder modules directly yet."
-            .to_string(),
-    )
+    Err(SEED_RUNNER_UNAVAILABLE.to_string())
 }
 
 /// Test database connection
@@ -429,13 +506,16 @@ async fn drop_db(config: &TideConfig, name: &str) -> Result<(), String> {
     runtime_db::drop_database(config, name).await
 }
 
-/// Wipe all tables
+/// Drop every table in the database (and, on PostgreSQL, the enum types)
 async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), String> {
     runtime_db::wipe_tables(config, drop_types).await
 }
 
 /// Get table columns
-async fn get_table_columns(config: &TideConfig, table_name: &str) -> Result<Vec<ColumnInfo>, String> {
+async fn get_table_columns(
+    config: &TideConfig,
+    table_name: &str,
+) -> Result<Vec<ColumnInfo>, String> {
     runtime_db::table_columns(config, table_name)
         .await
         .map(|columns| {
@@ -459,11 +539,29 @@ async fn get_all_tables(config: &TideConfig) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{check, drop_types_supported};
     use crate::config::TideConfig;
     use crate::runtime_db;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn drop_types_is_reported_as_postgres_only() {
+        let fixture = TempDbProject::new();
+        let mut config = TideConfig::load(fixture.config_path()).expect("config should load");
+
+        config.database.driver = "sqlite".to_string();
+        assert!(!drop_types_supported(&config));
+
+        config.database.driver = "mysql".to_string();
+        assert!(!drop_types_supported(&config));
+
+        config.database.driver = "postgres".to_string();
+        assert!(drop_types_supported(&config));
+
+        config.database.driver = "postgresql".to_string();
+        assert!(drop_types_supported(&config));
+    }
 
     #[tokio::test]
     async fn check_creates_metadata_tables_for_sqlite() {

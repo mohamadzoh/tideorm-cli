@@ -22,42 +22,12 @@ tideorm make model User \
   --relations="posts:has_many:Post,company:belongs_to:Company" \
   --timestamps --soft-deletes --tokenize --migration
 
-# Run migrations
+# Run migrations (`tideorm migrate` on its own does the same thing)
 tideorm migrate run
 
 # Seed the database
 tideorm db seed
-
-# Launch TideORM Studio (Web UI)
-tideorm ui
 ```
-
-## TideORM Studio (Web UI)
-
-TideORM CLI includes a beautiful web-based interface called **TideORM Studio** with an ocean-inspired theme.
-
-```bash
-# Start on localhost:8080
-tideorm ui
-
-# Custom host and port (for network access)
-tideorm ui --host=0.0.0.0 --port=3000
-
-# With verbose logging
-tideorm ui -v
-```
-
-### Features
-
-- **📊 Dashboard** - Quick actions and command history
-- **🏗️ Model Generator** - Visual form for creating models with all options
-- **📦 Migration Manager** - Create, run, rollback, and manage migrations
-- **🌱 Seeder Manager** - Create and execute database seeders
-- **⚡ Query Playground** - Interactive SQL editor with templates
-
-### Screenshots
-
-Once started, open your browser to `http://127.0.0.1:8080` (or your custom host/port).
 
 ## Configuration
 
@@ -106,43 +76,73 @@ primary_key_type = "i64"
 
 ```bash
 # Run all pending migrations
+tideorm migrate                   # Same as `tideorm migrate run`
 tideorm migrate run
 
 # Run migrations with options
-tideorm migrate run --pretend     # Show SQL without executing
+tideorm migrate run --pretend     # Show SQL without executing (never contacts the database)
 tideorm migrate run --force       # Force run in production
 tideorm migrate run --step=3      # Run only 3 migrations
+tideorm migrate run --path=other/migrations   # Run migrations from another directory
 
 # Generate a new migration
-tideorm migrate generate create_users_table
+tideorm migrate generate create_users_table   # alias: `gen`
 tideorm migrate generate create_users_table --create=users --fields="name:string,email:string"
 tideorm migrate generate add_avatar_to_users --table=users --fields="avatar_url:string:nullable"
 
 # Migration up/down
-tideorm migrate up                # Run next pending migration
-tideorm migrate up --step=3       # Run 3 migrations
-tideorm migrate down              # Rollback last migration
-tideorm migrate down --step=3     # Rollback 3 migrations
+tideorm migrate up                            # Run all pending migrations
+tideorm migrate up --step=3                   # Run 3 migrations
+tideorm migrate up --migration=create_users_table   # Run one specific migration
+tideorm migrate up --pretend                  # Show SQL without executing
+tideorm migrate up --force                    # Force run in production
+tideorm migrate down                          # Rollback the most recently applied migration
+tideorm migrate down --step=3                 # Rollback the last 3 applied migrations
+tideorm migrate down --migration=create_users_table  # Rollback one specific migration
+tideorm migrate down --pretend                # Show SQL without executing
+tideorm migrate down --force                  # Force run in production
 
 # Redo migrations
 tideorm migrate redo              # Rollback and re-run last migration
 tideorm migrate redo --step=3     # Redo last 3 migrations
+tideorm migrate redo --pretend    # Show SQL without executing
+tideorm migrate redo --force      # Force run in production
 
 # Fresh migrations (drop all tables and re-run)
+# Without --force this asks for confirmation and fails if it cannot prompt.
 tideorm migrate fresh
-tideorm migrate fresh --seed      # Also run seeders after
+tideorm migrate fresh --force            # Skip the confirmation prompt (required in production)
+tideorm migrate fresh --seed             # Also run seeders after
+tideorm migrate fresh --seed --seeder=UserSeeder   # Run one specific seeder after
 
 # Reset migrations (rollback all)
 tideorm migrate reset
+tideorm migrate reset --pretend   # List the migrations that would be rolled back
+tideorm migrate reset --force     # Force run in production
 
 # Refresh migrations (reset + migrate)
 tideorm migrate refresh
 tideorm migrate refresh --seed    # Also run seeders after
+tideorm migrate refresh --step=3  # Roll back and re-run only the last 3 migrations
+tideorm migrate refresh --force   # Force run in production
+
+# Reconcile the migration ledger without running any SQL
+# MySQL and MariaDB commit DDL implicitly, so a migration whose schema change
+# succeeded but whose ledger row was never written leaves later runs stuck on
+# "table already exists". These repair the ledger by hand.
+tideorm migrate mark --migration=create_users_table            # Record it as applied
+tideorm migrate mark --migration=create_users_table --unmark   # Record it as not applied
+tideorm migrate mark --migration=create_users_table --force    # Force run in production
 
 # View migration status
 tideorm migrate status
 tideorm migrate history
+tideorm migrate history --limit=25   # Default: 10, most recently applied first
 ```
+
+Rollback order follows the order migrations were *applied*, not their version
+strings, so a migration merged in from a long-lived branch is rolled back in the
+order it actually ran.
 
 ### Model Generation
 
@@ -157,7 +157,13 @@ tideorm make model User
 # Model with fields
 tideorm make model User --fields="name:string,email:string:unique,age:i32:nullable"
 
-# Field types: string, text, i32, i64, f32, f64, bool, datetime, date, time, uuid, json, decimal
+# Field types:
+#   string, text, i32, i64, f32, f64, bool, datetime, date, time,
+#   uuid, json, jsonb, decimal, bytes,
+#   int_array, bigint_array, text_array, bool_array, float_array, json_array
+#   (SQL spellings are accepted as aliases: varchar, tinyint, smallint, int, integer,
+#    bigint, float, double, boolean, timestamp, blob, binary, integer_array,
+#    string_array, boolean_array)
 # Field modifiers: nullable, unique, indexed, primary_key, auto_increment, default=value
 
 # Model with relations
@@ -181,9 +187,14 @@ tideorm make model Profile --nullable="bio,avatar_url,website"
 # Enable special features
 tideorm make model User --soft-deletes --timestamps --tokenize
 
-# Generate with migration and seeder
-tideorm make model User --fields="name:string" --migration --seeder
-tideorm make model User --all  # Same as --migration --seeder
+# Generate with migration, seeder and factory
+tideorm make model User --fields="name:string" --migration --seeder --factory
+tideorm make model User --all  # Same as --migration --seeder --factory
+
+# Write the model somewhere other than the configured [paths] models directory.
+# A companion --seeder/--factory generated in the same run imports the model from
+# wherever --output put it.
+tideorm make model User --output=src/domain/models
 
 # Full example
 tideorm make model BlogPost \
@@ -209,24 +220,38 @@ tideorm make model BlogPost \
 tideorm make migration create_posts_table
 tideorm make migration create_posts_table --create=posts --fields="title:string,body:text"
 
-# Generate a seeder
+# Generate a seeder (--count sets how many records the generated seeder creates)
 tideorm make seeder UserSeeder --model=User --count=50
 
 # Generate a factory
 tideorm make factory UserFactory --model=User
+
+# Every `make` generator accepts --output to choose the target directory
+tideorm make migration create_posts_table --output=db/migrations
+tideorm make seeder UserSeeder --model=User --output=db/seeders
+tideorm make factory UserFactory --model=User --output=db/factories
 ```
+
+`--output` defaults to the same value as the matching `[paths]` entry
+(`src/migrations`, `src/seeders`, `src/factories`, `src/models`). Left alone, the
+configured `[paths]` directory wins; passing anything else overrides it for that run
+only. The generated file and the `mod.rs` next to it both go to the chosen directory,
+so remember to declare that directory as a module in your crate.
+
+Moving a seeder or a factory does not move the model it imports: the generated
+`use crate::..` path is still derived from `[paths] models`.
 
 ### Database Commands
 
 ```bash
 # Run all seeders
 tideorm db seed
+tideorm db seed --seeder=UserSeeder   # Run a specific seeder (alias: --class)
+tideorm db seed --force               # Force run in production
 
-# Run a specific seeder
-tideorm db seed --seeder=UserSeeder
-
-# Drop all tables and re-seed
+# Drop all tables, re-run migrations and re-seed
 tideorm db fresh
+tideorm db fresh --force  # Skip the confirmation prompt (required in production)
 
 # Show database connection status
 tideorm db status
@@ -236,18 +261,28 @@ tideorm db check
 
 # Create the database
 tideorm db create
+tideorm db create --name=other_db   # For SQLite this is the database file path
 
 # Drop the database
 tideorm db drop
+tideorm db drop --name=other_db
 tideorm db drop --force  # Skip confirmation
 
-# Wipe all tables (truncate)
+# Wipe all tables - this DROPS every table, schema included; it is not a TRUNCATE.
+# `migrate fresh` relies on those drop semantics to rebuild from the migrations.
 tideorm db wipe
+tideorm db wipe --force        # Skip confirmation (required in production)
+tideorm db wipe --drop-types   # Also drop user-defined enum types (PostgreSQL only)
 
 # Show table information
 tideorm db table users
 tideorm db tables
 ```
+
+Destructive commands (`db drop`, `db wipe`, `db fresh`, `migrate fresh`) prompt for
+confirmation unless `--force` is given. A run that cannot prompt - no terminal, or
+`CI` / `TIDEORM_NONINTERACTIVE` set - fails with a non-zero exit rather than
+reporting a cancellation as success, so pass `--force` in scripts and CI.
 
 ### Utility Commands
 
@@ -267,23 +302,6 @@ tideorm schema
 tideorm schema --table=users
 ```
 
-### Web UI Commands
-
-```bash
-# Launch TideORM Studio on default port (127.0.0.1:8080)
-tideorm ui
-
-# Custom host and port
-tideorm ui --host=0.0.0.0 --port=3000
-tideorm ui -H 0.0.0.0 -p 3000
-
-# With verbose logging
-tideorm ui -v
-
-# Alias
-tideorm studio
-```
-
 ### Global Options
 
 All commands support these global options:
@@ -294,6 +312,12 @@ All commands support these global options:
 -h, --help             Show help
 -V, --version          Show version
 ```
+
+The generator commands (`tideorm make ...`, `tideorm migrate generate`, `tideorm models`)
+run without a `tideorm.toml` and fall back to the built-in defaults. A `tideorm.toml` that
+exists but cannot be read or parsed is always reported as an error instead - otherwise a
+typo in the config would silently generate Postgres code into `src/` for a project
+configured for another backend.
 
 ## Generated File Examples
 

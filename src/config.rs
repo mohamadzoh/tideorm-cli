@@ -151,45 +151,55 @@ fn default_timeout() -> u64 {
 
 impl DatabaseConfig {
     /// Build connection URL from configuration
+    ///
+    /// This never fails: a driver the CLI does not recognise is rendered with its own name
+    /// as the URL scheme so that read-only callers (`tideorm config`) keep working, and the
+    /// driver is reported by whoever tries to open a connection. Use
+    /// [`DatabaseConfig::try_connection_url`] to surface the unsupported driver directly.
     pub fn connection_url(&self) -> String {
+        self.try_connection_url()
+            .unwrap_or_else(|_| self.server_connection_url(&self.driver, None, ""))
+    }
+
+    /// Build connection URL from configuration, rejecting unsupported drivers.
+    pub fn try_connection_url(&self) -> Result<String, String> {
         if let Some(url) = &self.url {
             // Replace environment variables in URL
-            return self.expand_env_vars(url);
+            return Ok(self.expand_env_vars(url));
         }
 
-        match self.driver.as_str() {
-            "sqlite" => {
-                let path = self.sqlite_path.as_deref().unwrap_or("database.db");
-                sqlite_connection_url(path)
-            }
-            "postgres" | "postgresql" => {
-                let user = self.username.as_deref().unwrap_or("postgres");
-                let pass = self.password.as_deref().unwrap_or("");
-                let host = &self.host;
-                let port = self.port.unwrap_or(5432);
-                let db = self.database.as_deref().unwrap_or("tideorm");
-
-                if pass.is_empty() {
-                    format!("postgres://{}@{}:{}/{}", user, host, port, db)
-                } else {
-                    format!("postgres://{}:{}@{}:{}/{}", user, pass, host, port, db)
-                }
-            }
-            "mysql" => {
-                let user = self.username.as_deref().unwrap_or("root");
-                let pass = self.password.as_deref().unwrap_or("");
-                let host = &self.host;
-                let port = self.port.unwrap_or(3306);
-                let db = self.database.as_deref().unwrap_or("tideorm");
-
-                if pass.is_empty() {
-                    format!("mysql://{}@{}:{}/{}", user, host, port, db)
-                } else {
-                    format!("mysql://{}:{}@{}:{}/{}", user, pass, host, port, db)
-                }
-            }
-            _ => panic!("Unsupported database driver: {}", self.driver),
+        if self.driver == "sqlite" {
+            let path = self.sqlite_path.as_deref().unwrap_or("database.db");
+            return Ok(sqlite_connection_url(path));
         }
+
+        match driver_url_defaults(&self.driver) {
+            Some((scheme, port, user)) => Ok(self.server_connection_url(scheme, Some(port), user)),
+            None => Err(format!("Unsupported database driver: {}", self.driver)),
+        }
+    }
+
+    /// Render `scheme://user[:password]@host[:port]/database`.
+    ///
+    /// The credentials are percent-encoded: a password containing `@`, `:`, `/` or `#`
+    /// would otherwise close the userinfo component early and corrupt the URL.
+    fn server_connection_url(
+        &self,
+        scheme: &str,
+        default_port: Option<u16>,
+        default_user: &str,
+    ) -> String {
+        let user = self.username.as_deref().unwrap_or(default_user);
+        let password = self.password.as_deref().unwrap_or("");
+        let database = self.database.as_deref().unwrap_or("tideorm");
+        let authority = match self.port.or(default_port) {
+            Some(port) => format!("{}:{}", self.host, port),
+            None => self.host.clone(),
+        };
+
+        let userinfo = userinfo_prefix(user, password);
+
+        format!("{}://{}{}/{}", scheme, userinfo, authority, database)
     }
 
     /// Expand environment variables in a string
@@ -290,6 +300,84 @@ impl DatabaseConfig {
     }
 }
 
+/// Connection-URL defaults (scheme, port, username) for the drivers the CLI can build a
+/// URL for.
+///
+/// MariaDB speaks the MySQL wire protocol and has no scheme of its own, so it maps onto
+/// MySQL's defaults rather than being rejected.
+fn driver_url_defaults(driver: &str) -> Option<(&'static str, u16, &'static str)> {
+    match driver {
+        "postgres" | "postgresql" => Some(("postgres", 5432, "postgres")),
+        "mysql" | "mariadb" => Some(("mysql", 3306, "root")),
+        _ => None,
+    }
+}
+
+/// Render the `user[:password]@` prefix of a URL authority, or nothing when there are no
+/// credentials to carry.
+fn userinfo_prefix(username: &str, password: &str) -> String {
+    if username.is_empty() && password.is_empty() {
+        return String::new();
+    }
+
+    let username = encode_userinfo(username);
+    if password.is_empty() {
+        format!("{}@", username)
+    } else {
+        format!("{}:{}@", username, encode_userinfo(password))
+    }
+}
+
+/// Percent-encode a URL userinfo component (a username or a password).
+///
+/// Everything outside the RFC 3986 unreserved set is escaped, so credentials containing
+/// `@`, `:`, `/` or `#` survive a round trip through a connection URL instead of
+/// truncating it. Consumers (sqlx, and therefore SeaORM) percent-decode userinfo, so the
+/// original value is what reaches the server.
+pub(crate) fn encode_userinfo(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX[usize::from(byte >> 4)] as char);
+                encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+            }
+        }
+    }
+
+    encoded
+}
+
+/// Resolve the project environment, letting `TIDEORM_ENV` win.
+///
+/// Production guards are only useful when they can be switched on without editing a
+/// checked-in file, so an explicit `TIDEORM_ENV` (process environment or env file)
+/// overrides whatever `tideorm.toml` declares. Scaffolds emit
+/// `environment = "${TIDEORM_ENV}"`, which resolves to the development default when the
+/// variable is unset instead of leaking the placeholder through.
+fn resolve_environment(raw: &str, env_values: &HashMap<String, String>) -> String {
+    if let Some(environment) = lookup_env("TIDEORM_ENV", env_values) {
+        let environment = environment.trim();
+        if !environment.is_empty() {
+            return environment.to_string();
+        }
+    }
+
+    let expanded = expand_env_vars_with_sources(raw, env_values);
+    let expanded = expanded.trim();
+    if expanded.is_empty() || expanded.starts_with('$') {
+        return "development".to_string();
+    }
+
+    expanded.to_string()
+}
+
 fn expand_env_vars_with_sources(s: &str, env_values: &HashMap<String, String>) -> String {
     let mut result = s.to_string();
     let re = regex::Regex::new(r"\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)").unwrap();
@@ -310,7 +398,10 @@ fn lookup_env(name: &str, env_values: &HashMap<String, String>) -> Option<String
         .or_else(|| env_values.get(name).cloned())
 }
 
-fn load_env_file(config_dir: &Path, env_file_name: &str) -> Result<HashMap<String, String>, String> {
+fn load_env_file(
+    config_dir: &Path,
+    env_file_name: &str,
+) -> Result<HashMap<String, String>, String> {
     let env_path = config_dir.join(env_file_name);
     if !env_path.exists() {
         return Ok(HashMap::new());
@@ -556,15 +647,14 @@ impl TideConfig {
         )?;
 
         config.project.name = expand_env_vars_with_sources(&config.project.name, &env_values);
-        config.project.environment =
-            expand_env_vars_with_sources(&config.project.environment, &env_values);
-        config.project.env_file = expand_env_vars_with_sources(&config.project.env_file, &env_values);
+        config.project.environment = resolve_environment(&config.project.environment, &env_values);
+        config.project.env_file =
+            expand_env_vars_with_sources(&config.project.env_file, &env_values);
         config.paths.models = expand_env_vars_with_sources(&config.paths.models, &env_values);
         config.paths.migrations =
             expand_env_vars_with_sources(&config.paths.migrations, &env_values);
         config.paths.seeders = expand_env_vars_with_sources(&config.paths.seeders, &env_values);
-        config.paths.factories =
-            expand_env_vars_with_sources(&config.paths.factories, &env_values);
+        config.paths.factories = expand_env_vars_with_sources(&config.paths.factories, &env_values);
         config.paths.config_file =
             expand_env_vars_with_sources(&config.paths.config_file, &env_values);
         config.migration.table = expand_env_vars_with_sources(&config.migration.table, &env_values);
@@ -594,9 +684,19 @@ impl TideConfig {
         Ok(config)
     }
 
-    /// Load configuration or return default
-    pub fn load_or_default(path: &str) -> Self {
-        Self::load(path).unwrap_or_default()
+    /// Load configuration, falling back to defaults only when the file does not exist.
+    ///
+    /// A missing `tideorm.toml` is a legitimate "no project configuration" state for the
+    /// commands that only generate files, so it yields [`TideConfig::default`]. A file that
+    /// exists but cannot be read or parsed is always an error: silently replacing it with
+    /// the built-in (Postgres) defaults would emit code for the wrong backend into the
+    /// wrong directories.
+    pub fn load_or_default(path: &str) -> Result<Self, String> {
+        if Path::new(path).exists() {
+            Self::load(path)
+        } else {
+            Ok(Self::default())
+        }
     }
 
     /// Check if running in production
@@ -729,6 +829,117 @@ url = "${DATABASE_URL}"
         assert_eq!(config.database.port, Some(5433));
         assert_eq!(config.database.database.as_deref(), Some("app_db"));
         assert_eq!(config.database.username.as_deref(), Some("postgres"));
+    }
+
+    #[test]
+    fn test_connection_url_percent_encodes_credentials() {
+        let config = DatabaseConfig {
+            driver: "postgres".to_string(),
+            username: Some("a@b".to_string()),
+            password: Some("p@ss:w/rd#1".to_string()),
+            database: Some("mydb".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.connection_url(),
+            "postgres://a%40b:p%40ss%3Aw%2Frd%231@localhost:5432/mydb"
+        );
+    }
+
+    #[test]
+    fn test_connection_url_supports_mariadb() {
+        let config = DatabaseConfig {
+            driver: "mariadb".to_string(),
+            database: Some("shop".to_string()),
+            ..Default::default()
+        };
+
+        let url = config.connection_url();
+        assert_eq!(url, "mysql://root@localhost:3306/shop");
+    }
+
+    #[test]
+    fn test_connection_url_does_not_panic_on_unknown_driver() {
+        let config = DatabaseConfig {
+            driver: "oracle".to_string(),
+            database: Some("app".to_string()),
+            ..Default::default()
+        };
+
+        assert!(config.try_connection_url().is_err());
+        assert_eq!(config.connection_url(), "oracle://localhost/app");
+    }
+
+    #[test]
+    fn resolve_environment_prefers_tideorm_env() {
+        let mut env_values = HashMap::new();
+        env_values.insert("TIDEORM_ENV".to_string(), "production".to_string());
+        let resolved = resolve_environment("development", &env_values);
+
+        assert_eq!(resolved, "production");
+    }
+
+    #[test]
+    fn resolve_environment_falls_back_for_unresolved_placeholder() {
+        assert_eq!(
+            resolve_environment("${TIDEORM_ENV}", &HashMap::new()),
+            default_environment()
+        );
+    }
+
+    #[test]
+    fn test_load_environment_placeholder_enables_production_guards() {
+        let fixture = TempDir::new().unwrap();
+        let config_path = fixture.path().join("tideorm.toml");
+
+        fs::write(
+            &config_path,
+            r#"[project]
+name = "demo"
+environment = "${TIDEORM_ENV}"
+
+[database]
+driver = "sqlite"
+sqlite_path = "app.db"
+"#,
+        )
+        .unwrap();
+        fs::write(fixture.path().join(".env"), "TIDEORM_ENV=production\n").unwrap();
+
+        let config = TideConfig::load(config_path.to_str().unwrap()).unwrap();
+
+        assert_eq!(config.project.environment, "production");
+        assert!(config.is_production());
+    }
+
+    #[test]
+    fn test_load_or_default_reports_broken_config() {
+        let fixture = TempDir::new().unwrap();
+        let config_path = fixture.path().join("tideorm.toml");
+        fs::write(&config_path, "this is not = valid toml [\n").unwrap();
+
+        let path = config_path.to_str().unwrap();
+        assert!(TideConfig::load_or_default(path).is_err());
+
+        let absent = fixture.path().join("missing.toml");
+        let absent = absent.to_str().unwrap();
+        assert!(TideConfig::load_or_default(absent).is_ok());
+    }
+
+    #[test]
+    fn test_load_or_default_does_not_fall_back_to_postgres_for_a_broken_config() {
+        let fixture = TempDir::new().unwrap();
+        let config_path = fixture.path().join("tideorm.toml");
+        fs::write(
+            &config_path,
+            "[database]\ndriver = \"sqlite\"\nsqlite_path = \n",
+        )
+        .unwrap();
+
+        let error = TideConfig::load_or_default(config_path.to_str().unwrap())
+            .expect_err("a config file that exists but cannot be parsed must be reported");
+        assert!(error.contains("Failed to parse config file"), "{}", error);
     }
 
     #[test]

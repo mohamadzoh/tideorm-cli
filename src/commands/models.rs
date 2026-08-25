@@ -8,7 +8,9 @@ use std::path::Path;
 
 /// List all models in the project
 pub async fn list(config_path: &str, verbose: bool) -> Result<(), String> {
-    let config = TideConfig::load_or_default(config_path);
+    // Listing works without a project config, but a `tideorm.toml` that exists and cannot
+    // be parsed is reported rather than being replaced by the default `src/models`.
+    let config = TideConfig::load_or_default(config_path)?;
 
     if verbose {
         print_info(&format!("Looking for models in: {}", config.paths.models));
@@ -36,16 +38,39 @@ pub async fn list(config_path: &str, verbose: bool) -> Result<(), String> {
             "tideorm make model User --fields=\"name:string,email:string:unique\"".yellow()
         );
     } else {
-        println!("  {:<20} {:<30} {:<15} Features", "Model", "Table", "Fields");
+        println!(
+            "  {:<20} {:<30} {:<15} Features",
+            "Model", "Table", "Fields"
+        );
         println!("{}", "─".repeat(80));
 
         for model in &models {
             let features: Vec<&str> = [
-                if model.has_timestamps { Some("timestamps") } else { None },
-                if model.has_soft_deletes { Some("soft_delete") } else { None },
-                if model.has_tokenize { Some("tokenize") } else { None },
-                if !model.relations.is_empty() { Some("relations") } else { None },
-                if !model.translatable.is_empty() { Some("translatable") } else { None },
+                if model.has_timestamps {
+                    Some("timestamps")
+                } else {
+                    None
+                },
+                if model.has_soft_deletes {
+                    Some("soft_delete")
+                } else {
+                    None
+                },
+                if model.has_tokenize {
+                    Some("tokenize")
+                } else {
+                    None
+                },
+                if !model.relations.is_empty() {
+                    Some("relations")
+                } else {
+                    None
+                },
+                if !model.translatable.is_empty() {
+                    Some("translatable")
+                } else {
+                    None
+                },
             ]
             .into_iter()
             .flatten()
@@ -85,7 +110,9 @@ fn scan_models(models_path: &str) -> Result<Vec<ModelInfo>, String> {
     let path = Path::new(models_path);
     let mut models = Vec::new();
 
-    for entry in fs::read_dir(path).map_err(|e| format!("Failed to read models directory: {}", e))? {
+    for entry in
+        fs::read_dir(path).map_err(|e| format!("Failed to read models directory: {}", e))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let file_path = entry.path();
 
@@ -146,14 +173,16 @@ fn parse_model_file(content: &str) -> Option<ModelInfo> {
     let has_tokenize = content.contains("tokenize");
 
     // Find relations
-    let relation_pattern = regex::Regex::new(r#"#\[tideorm\([^)]*(?:belongs_to|has_one|has_many)[^)]*\)\]"#).ok()?;
+    let relation_pattern =
+        regex::Regex::new(r#"#\[tideorm\([^)]*(?:belongs_to|has_one|has_many)[^)]*\)\]"#).ok()?;
     let relations: Vec<String> = relation_pattern
         .find_iter(content)
         .map(|m| m.as_str().to_string())
         .collect();
 
     // Find translatable fields
-    let translatable_pattern = regex::Regex::new(r#"#\[tideorm\([^)]*translatable[^)]*\)\]"#).ok()?;
+    let translatable_pattern =
+        regex::Regex::new(r#"#\[tideorm\([^)]*translatable[^)]*\)\]"#).ok()?;
     let translatable: Vec<String> = translatable_pattern
         .find_iter(content)
         .map(|m| m.as_str().to_string())

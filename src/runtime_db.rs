@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use tideorm::internal::{ConnectionTrait, Statement};
+use tideorm::internal::{ConnectionTrait, OrmStatement as Statement};
 use tideorm::prelude::Database;
 
 pub const DEFAULT_SEEDERS_TABLE: &str = "_seeders";
@@ -34,7 +34,11 @@ pub struct ForeignKeyDetails {
 
 pub async fn connect(config: &TideConfig) -> Result<Database, String> {
     if normalized_driver(config) == "sqlite" {
-        let sqlite_path = config.database.sqlite_path.as_deref().unwrap_or("database.db");
+        let sqlite_path = config
+            .database
+            .sqlite_path
+            .as_deref()
+            .unwrap_or("database.db");
         create_database(config, sqlite_path).await?;
     }
 
@@ -45,12 +49,10 @@ pub async fn connect(config: &TideConfig) -> Result<Database, String> {
 
 pub async fn ping(config: &TideConfig) -> Result<(), String> {
     let db = connect(config).await?;
-    db.ping().await.map(|_| ()).map_err(|error| error.to_string())
-}
-
-pub async fn execute(config: &TideConfig, sql: &str) -> Result<u64, String> {
-    let db = connect(config).await?;
-    execute_on_db(&db, sql).await
+    db.ping()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 pub async fn query_json(config: &TideConfig, sql: &str) -> Result<Vec<Value>, String> {
@@ -86,9 +88,12 @@ pub async fn query_json_on_db(db: &Database, sql: &str) -> Result<Vec<Value>, St
         let mut object = serde_json::Map::new();
 
         for column_name in row.column_names() {
-            let json_value = if let Ok(value) = row.try_get::<Option<bool>>("", &column_name) {
+            // Integers must be probed before booleans: the SQLite bool decoder
+            // (and MySQL's, for TINYINT) accepts any integer, so a leading bool
+            // probe turns every integer column into `true`/`false`.
+            let json_value = if let Ok(value) = row.try_get::<Option<i64>>("", &column_name) {
                 value.map(Value::from).unwrap_or(Value::Null)
-            } else if let Ok(value) = row.try_get::<Option<i64>>("", &column_name) {
+            } else if let Ok(value) = row.try_get::<Option<bool>>("", &column_name) {
                 value.map(Value::from).unwrap_or(Value::Null)
             } else if let Ok(value) = row.try_get::<Option<f64>>("", &column_name) {
                 value.map(Value::from).unwrap_or(Value::Null)
@@ -208,9 +213,9 @@ pub async fn table_foreign_keys(
         .into_iter()
         .filter_map(|row| {
             Some(ForeignKeyDetails {
-                column: string_field(&row, &["column_name", "from"] )?,
-                references_table: string_field(&row, &["references_table", "table"] )?,
-                references_column: string_field(&row, &["references_column", "to"] )?,
+                column: string_field(&row, &["column_name", "from"])?,
+                references_table: string_field(&row, &["references_table", "table"])?,
+                references_column: string_field(&row, &["references_column", "to"])?,
             })
         })
         .collect())
@@ -254,7 +259,10 @@ pub async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), St
                     if let Some(type_name) = string_field(&row, &["type_name"]) {
                         execute_on_db(
                             &db,
-                            &format!("DROP TYPE IF EXISTS {} CASCADE", quoted_identifier(config, &type_name)),
+                            &format!(
+                                "DROP TYPE IF EXISTS {} CASCADE",
+                                quoted_identifier(config, &type_name)
+                            ),
                         )
                         .await?;
                     }
@@ -279,14 +287,15 @@ pub async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), St
     Ok(())
 }
 
+/// Create the target database.
+///
+/// For SQLite `database_name` is the database *file path* to create; callers
+/// decide whether that is a user-supplied target or the configured
+/// `sqlite_path`.
 pub async fn create_database(config: &TideConfig, database_name: &str) -> Result<(), String> {
     match normalized_driver(config) {
         "sqlite" => {
-            let path = config
-                .database
-                .sqlite_path
-                .as_deref()
-                .unwrap_or(database_name);
+            let path = sqlite_target_path(database_name)?;
             if let Some(parent) = Path::new(path).parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -304,7 +313,10 @@ pub async fn create_database(config: &TideConfig, database_name: &str) -> Result
             let admin_db = connect_with_url(&admin_connection_url(config)?).await?;
             execute_on_db(
                 &admin_db,
-                &format!("CREATE DATABASE {}", quoted_identifier(config, database_name)),
+                &format!(
+                    "CREATE DATABASE {}",
+                    quoted_identifier(config, database_name)
+                ),
             )
             .await
             .map(|_| ())
@@ -348,18 +360,23 @@ pub async fn ensure_migration_table_on_db(
 }
 
 pub async fn ensure_seeders_table_on_db(db: &Database, config: &TideConfig) -> Result<(), String> {
-    execute_on_db(db, &metadata_table_sql(config, DEFAULT_SEEDERS_TABLE, false)).await?;
+    execute_on_db(
+        db,
+        &metadata_table_sql(config, DEFAULT_SEEDERS_TABLE, false),
+    )
+    .await?;
     Ok(())
 }
 
+/// Drop the target database.
+///
+/// For SQLite `database_name` is the database *file path* to delete; callers
+/// decide whether that is a user-supplied target or the configured
+/// `sqlite_path`.
 pub async fn drop_database(config: &TideConfig, database_name: &str) -> Result<(), String> {
     match normalized_driver(config) {
         "sqlite" => {
-            let path = config
-                .database
-                .sqlite_path
-                .as_deref()
-                .unwrap_or(database_name);
+            let path = sqlite_target_path(database_name)?;
             if Path::new(path).exists() {
                 fs::remove_file(path).map_err(|error| error.to_string())?;
             }
@@ -374,7 +391,10 @@ pub async fn drop_database(config: &TideConfig, database_name: &str) -> Result<(
             let _ = execute_on_db(&admin_db, &terminate_sql).await;
             execute_on_db(
                 &admin_db,
-                &format!("DROP DATABASE IF EXISTS {}", quoted_identifier(config, database_name)),
+                &format!(
+                    "DROP DATABASE IF EXISTS {}",
+                    quoted_identifier(config, database_name)
+                ),
             )
             .await
             .map(|_| ())
@@ -383,26 +403,16 @@ pub async fn drop_database(config: &TideConfig, database_name: &str) -> Result<(
             let admin_db = connect_with_url(&admin_connection_url(config)?).await?;
             execute_on_db(
                 &admin_db,
-                &format!("DROP DATABASE IF EXISTS {}", quoted_identifier(config, database_name)),
+                &format!(
+                    "DROP DATABASE IF EXISTS {}",
+                    quoted_identifier(config, database_name)
+                ),
             )
             .await
             .map(|_| ())
         }
         driver => Err(format!("Unsupported database driver: {}", driver)),
     }
-}
-
-pub fn formats_result_set(sql: &str) -> bool {
-    let normalized = sql.trim_start().to_ascii_uppercase();
-
-    normalized.starts_with("SELECT")
-        || normalized.starts_with("WITH")
-        || normalized.starts_with("SHOW")
-        || normalized.starts_with("DESCRIBE")
-        || normalized.starts_with("DESC")
-        || normalized.starts_with("EXPLAIN")
-        || normalized.starts_with("PRAGMA")
-        || normalized.contains(" RETURNING ")
 }
 
 async fn connect_with_url(url: &str) -> Result<Database, String> {
@@ -423,16 +433,26 @@ fn admin_connection_url(config: &TideConfig) -> Result<String, String> {
 fn override_database_in_url(config: &TideConfig, database_name: &str) -> Result<String, String> {
     if config.database.url.is_some() {
         let url = config.database.connection_url();
-        let pattern = regex::Regex::new(r"^(?P<prefix>[a-zA-Z0-9+]+://[^/]+/)(?P<db>[^?]+)(?P<suffix>\?.*)?$")
-            .map_err(|error| error.to_string())?;
+        let pattern = regex::Regex::new(
+            r"^(?P<prefix>[a-zA-Z0-9+]+://[^/]+/)(?P<db>[^?]+)(?P<suffix>\?.*)?$",
+        )
+        .map_err(|error| error.to_string())?;
 
         if let Some(captures) = pattern.captures(&url) {
-            let prefix = captures.name("prefix").map(|value| value.as_str()).unwrap_or("");
-            let suffix = captures.name("suffix").map(|value| value.as_str()).unwrap_or("");
+            let prefix = captures
+                .name("prefix")
+                .map(|value| value.as_str())
+                .unwrap_or("");
+            let suffix = captures
+                .name("suffix")
+                .map(|value| value.as_str())
+                .unwrap_or("");
             return Ok(format!("{}{}{}", prefix, database_name, suffix));
         }
 
-        return Err("Failed to derive admin database URL from configured connection URL".to_string());
+        return Err(
+            "Failed to derive admin database URL from configured connection URL".to_string(),
+        );
     }
 
     match normalized_driver(config) {
@@ -443,9 +463,15 @@ fn override_database_in_url(config: &TideConfig, database_name: &str) -> Result<
             let port = config.database.port.unwrap_or(5432);
 
             if password.is_empty() {
-                Ok(format!("postgres://{}@{}:{}/{}", user, host, port, database_name))
+                Ok(format!(
+                    "postgres://{}@{}:{}/{}",
+                    user, host, port, database_name
+                ))
             } else {
-                Ok(format!("postgres://{}:{}@{}:{}/{}", user, password, host, port, database_name))
+                Ok(format!(
+                    "postgres://{}:{}@{}:{}/{}",
+                    user, password, host, port, database_name
+                ))
             }
         }
         "mysql" => {
@@ -455,9 +481,15 @@ fn override_database_in_url(config: &TideConfig, database_name: &str) -> Result<
             let port = config.database.port.unwrap_or(3306);
 
             if password.is_empty() {
-                Ok(format!("mysql://{}@{}:{}/{}", user, host, port, database_name))
+                Ok(format!(
+                    "mysql://{}@{}:{}/{}",
+                    user, host, port, database_name
+                ))
             } else {
-                Ok(format!("mysql://{}:{}@{}:{}/{}", user, password, host, port, database_name))
+                Ok(format!(
+                    "mysql://{}:{}@{}:{}/{}",
+                    user, password, host, port, database_name
+                ))
             }
         }
         driver => Err(format!("Unsupported database driver: {}", driver)),
@@ -524,10 +556,16 @@ fn columns_sql(config: &TideConfig, table_name: &str) -> Result<String, String> 
     })
 }
 
-async fn sqlite_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<IndexDetails>, String> {
+async fn sqlite_indexes(
+    config: &TideConfig,
+    table_name: &str,
+) -> Result<Vec<IndexDetails>, String> {
     let rows = query_json(
         config,
-        &format!("PRAGMA index_list({})", quoted_identifier(config, table_name)),
+        &format!(
+            "PRAGMA index_list({})",
+            quoted_identifier(config, table_name)
+        ),
     )
     .await?;
 
@@ -538,7 +576,10 @@ async fn sqlite_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<Ind
         };
         let columns = query_json(
             config,
-            &format!("PRAGMA index_info({})", quoted_identifier(config, &index_name)),
+            &format!(
+                "PRAGMA index_info({})",
+                quoted_identifier(config, &index_name)
+            ),
         )
         .await?
         .into_iter()
@@ -555,7 +596,10 @@ async fn sqlite_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<Ind
     Ok(indexes)
 }
 
-async fn postgres_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<IndexDetails>, String> {
+async fn postgres_indexes(
+    config: &TideConfig,
+    table_name: &str,
+) -> Result<Vec<IndexDetails>, String> {
     let rows = query_json(
         config,
         &format!(
@@ -565,7 +609,8 @@ async fn postgres_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<I
     )
     .await?;
 
-    let capture = regex::Regex::new(r"\((?P<columns>[^\)]*)\)").map_err(|error| error.to_string())?;
+    let capture =
+        regex::Regex::new(r"\((?P<columns>[^\)]*)\)").map_err(|error| error.to_string())?;
 
     Ok(rows
         .into_iter()
@@ -609,11 +654,13 @@ async fn mysql_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<Inde
         let column_name = string_field(&row, &["Column_name"]).unwrap_or_default();
         let unique = int_field(&row, &["Non_unique"]).unwrap_or(1) == 0;
 
-        let entry = grouped.entry(index_name.clone()).or_insert_with(|| IndexDetails {
-            name: index_name.clone(),
-            columns: Vec::new(),
-            unique,
-        });
+        let entry = grouped
+            .entry(index_name.clone())
+            .or_insert_with(|| IndexDetails {
+                name: index_name.clone(),
+                columns: Vec::new(),
+                unique,
+            });
         if !column_name.is_empty() {
             entry.columns.push(column_name);
         }
@@ -631,7 +678,11 @@ fn column_from_row(config: &TideConfig, row: &Value) -> ColumnDetails {
             name: string_field(row, &["name", "column_name"]).unwrap_or_default(),
             data_type: string_field(row, &["type", "data_type"]).unwrap_or_default(),
             nullable,
-            key: if is_primary { Some("PRI".to_string()) } else { None },
+            key: if is_primary {
+                Some("PRI".to_string())
+            } else {
+                None
+            },
             default: string_field(row, &["dflt_value", "default_value"]),
             extra: None,
         };
@@ -645,6 +696,19 @@ fn column_from_row(config: &TideConfig, row: &Value) -> ColumnDetails {
         default: string_field(row, &["default_value", "column_default", "dflt_value"]),
         extra: string_field(row, &["extra"]),
     }
+}
+
+/// Validate the SQLite database file path a command is about to act on.
+///
+/// Relative paths stay relative to the current directory, which is how the
+/// configured `sqlite_path` is interpreted everywhere else.
+fn sqlite_target_path(database_name: &str) -> Result<&str, String> {
+    let path = database_name.trim();
+    if path.is_empty() {
+        return Err("SQLite database path not specified".to_string());
+    }
+
+    Ok(path)
 }
 
 fn normalized_driver(config: &TideConfig) -> &str {
@@ -667,7 +731,11 @@ fn metadata_table_sql(config: &TideConfig, table_name: &str, include_version: bo
     let applied_at = quoted_identifier(config, "applied_at");
     let table = quoted_identifier(config, table_name);
     let version_column = if include_version {
-        format!(", {} {} NOT NULL UNIQUE", quoted_identifier(config, "version"), metadata_text_type(config))
+        format!(
+            ", {} {} NOT NULL UNIQUE",
+            quoted_identifier(config, "version"),
+            metadata_text_type(config)
+        )
     } else {
         String::new()
     };
@@ -684,11 +752,7 @@ fn metadata_table_sql(config: &TideConfig, table_name: &str, include_version: bo
         ),
         "sqlite" => format!(
             "CREATE TABLE IF NOT EXISTS {} ({} INTEGER PRIMARY KEY AUTOINCREMENT{}, {} TEXT NOT NULL UNIQUE, {} TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            table,
-            id,
-            version_column,
-            name,
-            applied_at,
+            table, id, version_column, name, applied_at,
         ),
         _ => format!(
             "CREATE TABLE IF NOT EXISTS {} ({} SERIAL PRIMARY KEY{}, {} {} NOT NULL UNIQUE, {} TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",

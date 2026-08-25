@@ -24,7 +24,10 @@ pub async fn show(config_path: &str, table: Option<String>, verbose: bool) -> Re
 async fn show_table_schema(config: &TideConfig, table_name: &str) -> Result<(), String> {
     let columns = get_table_schema(config, table_name).await?;
 
-    println!("\n{}", format!("Schema for table: {}", table_name).cyan().bold());
+    println!(
+        "\n{}",
+        format!("Schema for table: {}", table_name).cyan().bold()
+    );
     println!("{}", "═".repeat(100));
 
     // Table header
@@ -93,9 +96,9 @@ async fn show_all_schemas(config: &TideConfig) -> Result<(), String> {
 
     for table in &tables {
         let columns = get_table_schema(config, table).await?;
-        
+
         println!("\n  {} ({})", table.green().bold(), columns.len());
-        
+
         for col in &columns {
             let key_marker = match col.key.as_deref() {
                 Some("PRI") => " 🔑",
@@ -103,15 +106,12 @@ async fn show_all_schemas(config: &TideConfig) -> Result<(), String> {
                 Some("MUL") | Some("FK") => " 🔗",
                 _ => "",
             };
-            
+
             let nullable = if col.nullable { "?" } else { "" };
-            
+
             println!(
                 "    ├─ {}: {}{}{}",
-                col.name,
-                col.data_type,
-                nullable,
-                key_marker
+                col.name, col.data_type, nullable, key_marker
             );
         }
     }
@@ -159,7 +159,10 @@ async fn get_all_tables(config: &TideConfig) -> Result<Vec<String>, String> {
 }
 
 /// Get schema for a table
-async fn get_table_schema(config: &TideConfig, table_name: &str) -> Result<Vec<ColumnSchema>, String> {
+async fn get_table_schema(
+    config: &TideConfig,
+    table_name: &str,
+) -> Result<Vec<ColumnSchema>, String> {
     runtime_db::table_columns(config, table_name)
         .await
         .map(|columns| {
@@ -178,7 +181,10 @@ async fn get_table_schema(config: &TideConfig, table_name: &str) -> Result<Vec<C
 }
 
 /// Get indexes for a table
-async fn get_table_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<IndexInfo>, String> {
+async fn get_table_indexes(
+    config: &TideConfig,
+    table_name: &str,
+) -> Result<Vec<IndexInfo>, String> {
     runtime_db::table_indexes(config, table_name)
         .await
         .map(|indexes| {
@@ -194,7 +200,10 @@ async fn get_table_indexes(config: &TideConfig, table_name: &str) -> Result<Vec<
 }
 
 /// Get foreign keys for a table
-async fn get_foreign_keys(config: &TideConfig, table_name: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+async fn get_foreign_keys(
+    config: &TideConfig,
+    table_name: &str,
+) -> Result<Vec<ForeignKeyInfo>, String> {
     runtime_db::table_foreign_keys(config, table_name)
         .await
         .map(|foreign_keys| {

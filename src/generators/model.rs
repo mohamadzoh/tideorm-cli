@@ -10,8 +10,9 @@
 
 use crate::config::TideConfig;
 use crate::utils::{
-    ensure_directory, pluralize, render_template, to_pascal_case, to_snake_case,
-    FieldDefinition, RelationDefinition, RelationType,
+    FieldDefinition, RelationDefinition, RelationType, ensure_directory, ensure_writable,
+    escape_ident, pluralize, render_template, rust_type_for_field_type, to_pascal_case,
+    to_snake_case, validate_sql_object_name,
 };
 use serde::Serialize;
 
@@ -216,6 +217,8 @@ impl<'a> ModelGenerator<'a> {
         let file_name = format!("{}.rs", to_snake_case(&self.name));
         let file_path = format!("{}/{}", self.output_dir, file_name);
 
+        ensure_writable(&file_path)?;
+
         std::fs::write(&file_path, content)
             .map_err(|e| format!("Failed to write model file: {}", e))?;
 
@@ -227,16 +230,13 @@ impl<'a> ModelGenerator<'a> {
 
     /// Generate the model file content
     fn generate_content(&self) -> Result<String, String> {
+        // The table name is written into a `table = ".."` string literal, so a name
+        // carrying a quote would inject arbitrary Rust into the generated model.
+        validate_sql_object_name("table", &self.table_name())?;
+
         let context = ModelTemplateContext {
             name: self.name.clone(),
-            related_imports: self
-                .relations
-                .iter()
-                .map(|relation| ModelImportContext {
-                    module: to_snake_case(&relation.related_model),
-                    name: relation.related_model.clone(),
-                })
-                .collect(),
+            related_imports: self.build_related_imports(),
             struct_attributes: self.build_struct_attributes(),
             struct_fields: self.build_struct_fields(),
             methods: self.build_impl_methods(),
@@ -250,39 +250,80 @@ impl<'a> ModelGenerator<'a> {
         )
     }
 
+    /// Collect the `use super::..` imports for related models.
+    ///
+    /// The same model may back several relations, and a self-relation refers to the struct
+    /// being defined here, so both cases must be dropped or the file will not compile.
+    fn build_related_imports(&self) -> Vec<ModelImportContext> {
+        let mut imports: Vec<ModelImportContext> = Vec::new();
+
+        for relation in &self.relations {
+            if relation.related_model == self.name {
+                continue;
+            }
+
+            if imports
+                .iter()
+                .any(|import| import.name == relation.related_model)
+            {
+                continue;
+            }
+
+            imports.push(ModelImportContext {
+                module: escape_ident(&to_snake_case(&relation.related_model)),
+                name: relation.related_model.clone(),
+            });
+        }
+
+        imports
+    }
+
+    /// The table this model binds to, honouring an explicit `--table` override.
+    fn table_name(&self) -> String {
+        self.table
+            .clone()
+            .unwrap_or_else(|| pluralize(&to_snake_case(&self.name)))
+    }
+
     fn build_struct_attributes(&self) -> Vec<String> {
-        // Table name
-        let table_name = self.table.clone().unwrap_or_else(|| {
-            pluralize(&to_snake_case(&self.name))
-        });
+        let table_name = self.table_name();
 
         let mut attributes = Vec::new();
         let mut tide_attrs = vec![format!("table = \"{}\"", table_name)];
-        
+
         if self.soft_deletes {
             tide_attrs.push("soft_delete".to_string());
         }
-        
+
         if self.tokenize {
             tide_attrs.push("tokenize".to_string());
         }
-        
+
         // Translatable fields (struct-level attribute)
         if !self.translatable.is_empty() {
-            tide_attrs.push(format!("translatable = \"{}\"", self.translatable.join(",")));
+            tide_attrs.push(format!(
+                "translatable = \"{}\"",
+                self.translatable.join(",")
+            ));
         }
-        
+
         // File attachments (struct-level attributes)
         if !self.attachments_single.is_empty() {
-            tide_attrs.push(format!("has_one_files = \"{}\"", self.attachments_single.join(",")));
+            tide_attrs.push(format!(
+                "has_one_files = \"{}\"",
+                self.attachments_single.join(",")
+            ));
         }
-        
+
         if !self.attachments_multi.is_empty() {
-            tide_attrs.push(format!("has_many_files = \"{}\"", self.attachments_multi.join(",")));
+            tide_attrs.push(format!(
+                "has_many_files = \"{}\"",
+                self.attachments_multi.join(",")
+            ));
         }
 
         attributes.push(format!("#[tideorm::model({})]", tide_attrs.join(", ")));
-        
+
         // Index attributes (struct-level)
         for field_name in &self.indexed {
             attributes.push(format!("#[index(\"{}\")]", field_name));
@@ -293,7 +334,7 @@ impl<'a> ModelGenerator<'a> {
                 attributes.push(format!("#[index(\"{}\")]", field_name));
             }
         }
-        
+
         // Unique index attributes (struct-level)
         for field_name in &self.unique {
             attributes.push(format!("#[unique_index(\"{}\")]", field_name));
@@ -315,10 +356,12 @@ impl<'a> ModelGenerator<'a> {
             fields.push(ModelFieldTemplateContext {
                 doc_comment: None,
                 attribute: Some("#[tideorm(primary_key, auto_increment)]".to_string()),
+                // The configured type is a field type alias like every other one, so it has
+                // to go through the same mapper: `bigint` is `i64`, not a Rust type.
                 declaration: format!(
                     "pub {}: {},",
-                    self.config.model.primary_key,
-                    self.config.model.primary_key_type
+                    escape_ident(&self.config.model.primary_key),
+                    rust_type_for_field_type(&self.config.model.primary_key_type)
                 ),
             });
         }
@@ -327,8 +370,9 @@ impl<'a> ModelGenerator<'a> {
         for field in self.generated_fields() {
             let mut field_attrs = Vec::new();
             let is_primary_key = field.primary_key || field.name == self.config.model.primary_key;
-            let is_auto_increment = field.auto_increment
-                || (is_primary_key && field.name == self.config.model.primary_key);
+            // Auto increment is never inferred from the field name: the migration side only
+            // emits it when the modifier was given, and the two must describe the same table.
+            let is_auto_increment = field.auto_increment;
 
             // Check if this field should be nullable
             let is_nullable = field.nullable || self.nullable.contains(&field.name);
@@ -349,53 +393,59 @@ impl<'a> ModelGenerator<'a> {
                 field_attrs.push(format!("default = \"{}\"", default));
             }
 
-            let rust_type = if is_nullable && !field.nullable {
-                format!("Option<{}>", field.rust_type().replace("Option<", "").replace(">", ""))
-            } else {
-                field.rust_type()
-            };
+            let rust_type = field.rust_type_for(is_nullable);
 
             fields.push(ModelFieldTemplateContext {
                 doc_comment: None,
                 attribute: (!field_attrs.is_empty())
                     .then(|| format!("#[tideorm({})]", field_attrs.join(", "))),
-                declaration: format!("pub {}: {},", field.name, rust_type),
+                declaration: format!("pub {}: {},", escape_ident(&field.name), rust_type),
             });
         }
-        
+
         // Relation fields (SeaORM-style: defined inside the struct)
         for rel in &self.relations {
-            let fk = rel.foreign_key.clone().unwrap_or_else(|| {
-                match rel.relation_type {
+            let fk = rel
+                .foreign_key
+                .clone()
+                .unwrap_or_else(|| match rel.relation_type {
                     RelationType::BelongsTo => format!("{}_id", to_snake_case(&rel.related_model)),
                     RelationType::HasOne | RelationType::HasMany => {
                         format!("{}_id", to_snake_case(&self.name))
                     }
-                }
-            });
-            
+                });
+
             let (rel_attr, rel_type) = match rel.relation_type {
                 RelationType::BelongsTo => (
-                    format!("belongs_to = \"{}\", foreign_key = \"{}\"", rel.related_model, fk),
-                    format!("BelongsTo<{}>", rel.related_model)
+                    format!(
+                        "belongs_to = \"{}\", foreign_key = \"{}\"",
+                        rel.related_model, fk
+                    ),
+                    format!("BelongsTo<{}>", rel.related_model),
                 ),
                 RelationType::HasOne => (
-                    format!("has_one = \"{}\", foreign_key = \"{}\"", rel.related_model, fk),
-                    format!("HasOne<{}>", rel.related_model)
+                    format!(
+                        "has_one = \"{}\", foreign_key = \"{}\"",
+                        rel.related_model, fk
+                    ),
+                    format!("HasOne<{}>", rel.related_model),
                 ),
                 RelationType::HasMany => (
-                    format!("has_many = \"{}\", foreign_key = \"{}\"", rel.related_model, fk),
-                    format!("HasMany<{}>", rel.related_model)
+                    format!(
+                        "has_many = \"{}\", foreign_key = \"{}\"",
+                        rel.related_model, fk
+                    ),
+                    format!("HasMany<{}>", rel.related_model),
                 ),
             };
-            
+
             fields.push(ModelFieldTemplateContext {
                 doc_comment: None,
                 attribute: Some(format!("#[tideorm({})]", rel_attr)),
-                declaration: format!("pub {}: {},", rel.name, rel_type),
+                declaration: format!("pub {}: {},", escape_ident(&rel.name), rel_type),
             });
         }
-        
+
         if !self.translatable.is_empty() {
             fields.push(ModelFieldTemplateContext {
                 doc_comment: Some("/// JSONB column for field translations".to_string()),
@@ -446,18 +496,14 @@ impl<'a> ModelGenerator<'a> {
         for field in self.generated_fields() {
             if field.unique || self.unique.contains(&field.name) {
                 let rust_type = self.finder_param_type(&field);
+                let param = escape_ident(&field.name);
                 impl_lines.push(format!(
                     r#"    /// Find by {}
     pub async fn find_by_{}({}: {}) -> tideorm::Result<Option<Self>> {{
         Self::query().where_eq("{}", {}).first().await
     }}
 "#,
-                    field.name,
-                    field.name,
-                    field.name,
-                    rust_type,
-                    field.name,
-                    field.name
+                    field.name, field.name, param, rust_type, field.name, param
                 ));
             }
         }
@@ -468,7 +514,7 @@ impl<'a> ModelGenerator<'a> {
     fn finder_param_type(&self, field: &FieldDefinition) -> String {
         match field.field_type.to_lowercase().as_str() {
             "string" | "varchar" | "text" => "&str".to_string(),
-            _ => field.rust_type().replace("Option<", "").replace(">", ""),
+            _ => field.base_rust_type(),
         }
     }
 
@@ -480,9 +526,10 @@ impl<'a> ModelGenerator<'a> {
                 continue;
             }
 
-            let foreign_key = relation.foreign_key.clone().unwrap_or_else(|| {
-                format!("{}_id", to_snake_case(&relation.related_model))
-            });
+            let foreign_key = relation
+                .foreign_key
+                .clone()
+                .unwrap_or_else(|| format!("{}_id", to_snake_case(&relation.related_model)));
 
             if fields.iter().any(|field| field.name == foreign_key) {
                 continue;
@@ -520,24 +567,31 @@ impl<'a> ModelGenerator<'a> {
     }
 
     fn has_explicit_primary_key(&self) -> bool {
-        self.generated_fields().into_iter().any(|field| {
-            field.primary_key || field.name == self.config.model.primary_key
-        })
+        self.generated_fields()
+            .into_iter()
+            .any(|field| field.primary_key || field.name == self.config.model.primary_key)
     }
 
     /// Update the mod.rs file to include the new model
     fn update_mod_file(&self) -> Result<(), String> {
         let mod_path = format!("{}/mod.rs", self.output_dir);
-        let module_name = to_snake_case(&self.name);
+        let file_stem = to_snake_case(&self.name);
+        let module_name = escape_ident(&file_stem);
 
         // Read existing content
         let existing = std::fs::read_to_string(&mod_path).unwrap_or_default();
 
         // Check if already included
-        let module_decl = format!("pub mod {};", module_name);
-        if existing.contains(&module_decl) {
+        if existing.contains(&format!("pub mod {};", module_name)) {
             return Ok(());
         }
+
+        // `r#name` still resolves to `name.rs`, but the underscore fallback does not.
+        let module_decl = if module_name.trim_start_matches("r#") == file_stem {
+            format!("pub mod {};", module_name)
+        } else {
+            format!("#[path = \"{}.rs\"]\npub mod {};", file_stem, module_name)
+        };
 
         let new_content = format!("{}{}\n", existing, module_decl);
 
@@ -633,7 +687,7 @@ mod tests {
         assert_eq!(rel.related_model, "Post");
         assert_eq!(rel.relation_type, RelationType::HasMany);
     }
-    
+
     #[test]
     fn test_generated_model_uses_correct_syntax() {
         let config = TideConfig::default();
@@ -644,33 +698,33 @@ mod tests {
             .unique(Some("email".to_string()));
 
         let content = generator.generate_content().unwrap();
-        
+
         // Generated models should use the canonical TideORM model attribute
-        assert!(content.contains("#[tideorm::model(table = \"users\")]") );
+        assert!(content.contains("#[tideorm::model(table = \"users\")]"));
         assert!(!content.contains("#[derive(tideorm::Model)]"));
-        
+
         // Should use struct-level #[index()] and #[unique_index()]
         assert!(content.contains("#[index(\"email\")]"));
         assert!(content.contains("#[unique_index(\"email\")]"));
-        
+
         // Should NOT use legacy auto timestamp attributes
         assert!(!content.contains("auto_now_add"));
         assert!(!content.contains("auto_now"));
-        
+
         // Timestamps should be plain DateTime fields
         assert!(content.contains("pub created_at: chrono::DateTime<chrono::Utc>,"));
         assert!(content.contains("pub updated_at: chrono::DateTime<chrono::Utc>,"));
     }
-    
+
     #[test]
     fn test_relations_as_struct_fields() {
         let config = TideConfig::default();
-        let generator = ModelGenerator::new(&config)
-            .name("User")
-            .relations(Some("posts:has_many:Post,profile:has_one:Profile".to_string()));
+        let generator = ModelGenerator::new(&config).name("User").relations(Some(
+            "posts:has_many:Post,profile:has_one:Profile".to_string(),
+        ));
 
         let content = generator.generate_content().unwrap();
-        
+
         // Relations should be defined as struct fields with proper types
         assert!(content.contains("HasMany<Post>"));
         assert!(content.contains("HasOne<Profile>"));
@@ -688,7 +742,9 @@ mod tests {
 
         let content = generator.generate_content().unwrap();
 
-        assert!(content.contains("#[tideorm::model(table = \"products\", translatable = \"name,description\")]"));
+        assert!(content.contains(
+            "#[tideorm::model(table = \"products\", translatable = \"name,description\")]"
+        ));
         assert!(content.contains("pub translations: Option<JsonValue>,"));
     }
 
@@ -701,7 +757,11 @@ mod tests {
 
         let content = generator.generate_content().unwrap();
 
-        assert!(content.contains("pub async fn find_by_email(email: &str) -> tideorm::Result<Option<Self>>"));
+        assert!(
+            content.contains(
+                "pub async fn find_by_email(email: &str) -> tideorm::Result<Option<Self>>"
+            )
+        );
         assert!(!content.contains("pub async fn find_by_email(email: String)"));
         assert!(!content.contains("pub async fn find_by_email(email: &String)"));
     }
@@ -718,6 +778,95 @@ mod tests {
         assert!(content.contains("pub user_id: i64,"));
         assert!(content.contains("#[index(\"user_id\")]"));
         assert!(content.contains("pub author: BelongsTo<User>,"));
+    }
+
+    #[test]
+    fn test_keyword_field_names_are_raw_escaped() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config)
+            .name("Document")
+            .fields(Some("type:string:unique".to_string()));
+
+        let content = generator.generate_content().unwrap();
+
+        assert!(content.contains("pub r#type: String,"));
+        assert!(content.contains("pub async fn find_by_type(r#type: &str)"));
+        assert!(content.contains(".where_eq(\"type\", r#type)"));
+    }
+
+    #[test]
+    fn test_nullable_flag_wraps_generic_types() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config)
+            .name("Post")
+            .fields(Some("published_at:datetime".to_string()))
+            .nullable(Some("published_at".to_string()));
+
+        let content = generator.generate_content().unwrap();
+
+        assert!(content.contains("pub published_at: Option<chrono::DateTime<chrono::Utc>>,"));
+    }
+
+    #[test]
+    fn test_explicit_id_field_is_not_forced_to_auto_increment() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config)
+            .name("Reading")
+            .fields(Some("id:i32".to_string()));
+
+        let content = generator.generate_content().unwrap();
+
+        assert!(content.contains("#[tideorm(primary_key)]"));
+        assert!(!content.contains("auto_increment"));
+        assert!(content.contains("pub id: i32,"));
+    }
+
+    #[test]
+    fn test_repeated_and_self_relations_do_not_duplicate_imports() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config).name("Comment").relations(Some(
+            "author:belongs_to:User,editor:belongs_to:User:editor_id,parent:belongs_to:Comment:parent_id"
+                .to_string(),
+        ));
+
+        let content = generator.generate_content().unwrap();
+
+        assert_eq!(content.matches("use super::user::User;").count(), 1);
+        assert!(!content.contains("use super::comment::Comment;"));
+    }
+
+    #[test]
+    fn test_configured_primary_key_type_goes_through_the_type_mapper() {
+        let mut config = TideConfig::default();
+        config.model.primary_key_type = "bigint".to_string();
+
+        let content = ModelGenerator::new(&config)
+            .name("User")
+            .generate_content()
+            .unwrap();
+
+        assert!(content.contains("pub id: i64,"));
+        assert!(!content.contains("pub id: bigint,"));
+
+        config.model.primary_key_type = "uuid".to_string();
+        let content = ModelGenerator::new(&config)
+            .name("User")
+            .generate_content()
+            .unwrap();
+
+        assert!(content.contains("pub id: Uuid,"));
+    }
+
+    #[test]
+    fn test_table_names_that_would_break_the_attribute_are_rejected() {
+        let config = TideConfig::default();
+        let error = ModelGenerator::new(&config)
+            .name("User")
+            .table(Some("users\", soft_delete)] fn evil() {}//".to_string()))
+            .generate_content()
+            .unwrap_err();
+
+        assert!(error.contains("Invalid table name"));
     }
 
     #[test]

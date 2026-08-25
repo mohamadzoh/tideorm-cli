@@ -9,14 +9,14 @@
 //! # Usage
 //!
 //! ```bash
-//! # Run migrations
+//! # Run pending migrations
 //! tideorm migrate
 //!
 //! # Generate a model
 //! tideorm make model User --fields="name:string,email:string:unique"
 //!
 //! # Run seeders
-//! tideorm db:seed
+//! tideorm db seed
 //! ```
 
 mod commands;
@@ -53,9 +53,11 @@ enum Commands {
     // =========================================================================
     // MIGRATION COMMANDS
     // =========================================================================
-    /// Migration commands - run with subcommands or directly to execute pending migrations
-    #[command(subcommand)]
-    Migrate(MigrateCommands),
+    /// Migration commands - run with a subcommand, or on its own to execute pending migrations
+    Migrate {
+        #[command(subcommand)]
+        command: Option<MigrateCommands>,
+    },
 
     // =========================================================================
     // MAKE COMMANDS (Generators)
@@ -96,21 +98,6 @@ enum Commands {
         /// Table name to show schema for
         #[arg(short, long)]
         table: Option<String>,
-    },
-
-    // =========================================================================
-    // WEB UI
-    // =========================================================================
-    /// Launch TideORM Studio - Web-based UI for TideORM
-    #[command(name = "ui", alias = "studio")]
-    Ui {
-        /// Host address to bind to
-        #[arg(short = 'H', long, default_value = "127.0.0.1")]
-        host: String,
-
-        /// Port to run the server on
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
     },
 }
 
@@ -154,9 +141,9 @@ enum MigrateCommands {
         fields: Option<String>,
     },
 
-    /// Run migration up
+    /// Run pending migrations - all of them unless --step or --migration narrows it down
     Up {
-        /// Number of migrations to run
+        /// Number of pending migrations to run (default: all of them)
         #[arg(long)]
         step: Option<u32>,
 
@@ -167,11 +154,15 @@ enum MigrateCommands {
         /// Pretend mode
         #[arg(long)]
         pretend: bool,
+
+        /// Force run in production
+        #[arg(long)]
+        force: bool,
     },
 
-    /// Run migration down (rollback)
+    /// Roll back applied migrations - only the most recent one unless --step says otherwise
     Down {
-        /// Number of migrations to rollback
+        /// Number of migrations to rollback (default: 1)
         #[arg(long, default_value = "1")]
         step: u32,
 
@@ -182,6 +173,10 @@ enum MigrateCommands {
         /// Pretend mode
         #[arg(long)]
         pretend: bool,
+
+        /// Force run in production
+        #[arg(long)]
+        force: bool,
     },
 
     /// Redo last migration (down then up)
@@ -193,6 +188,10 @@ enum MigrateCommands {
         /// Pretend mode
         #[arg(long)]
         pretend: bool,
+
+        /// Force run in production
+        #[arg(long)]
+        force: bool,
     },
 
     /// Rollback all migrations and re-run
@@ -230,6 +229,25 @@ enum MigrateCommands {
         /// Number of migrations to refresh
         #[arg(long)]
         step: Option<u32>,
+
+        /// Force run in production
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Record a migration as applied without running it
+    ///
+    /// Escape hatch for backends that commit DDL implicitly (MySQL/MariaDB): when a
+    /// migration's schema change survived but its ledger row did not, this reconciles
+    /// the ledger so later runs stop failing. Pass --unmark for the opposite repair.
+    Mark {
+        /// Migration to record (file name, version or logical name)
+        #[arg(long)]
+        migration: String,
+
+        /// Remove the ledger entry instead of adding it
+        #[arg(long)]
+        unmark: bool,
 
         /// Force run in production
         #[arg(long)]
@@ -303,23 +321,33 @@ enum MakeCommands {
         #[arg(long, alias = "null")]
         nullable: Option<String>,
 
-        /// Enable soft deletes
-        #[arg(long, alias = "soft-delete")]
-        soft_deletes: bool,
-
-        /// Enable timestamps (created_at, updated_at) - enabled by default, pass --timestamps=false to disable
+        /// Enable soft deletes - defaults to `[model] soft_deletes` in tideorm.toml (false)
         #[arg(
             long,
-            default_value_t = true,
+            alias = "soft-delete",
             action = clap::ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true"
         )]
-        timestamps: bool,
+        soft_deletes: Option<bool>,
 
-        /// Enable tokenization
-        #[arg(long)]
-        tokenize: bool,
+        /// Enable timestamps (created_at, updated_at) - defaults to `[model] timestamps` in tideorm.toml (true); pass --timestamps=false to disable
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
+        timestamps: Option<bool>,
+
+        /// Enable tokenization - defaults to `[model] tokenize` in tideorm.toml (false)
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true"
+        )]
+        tokenize: Option<bool>,
 
         /// Output directory for the model file
         #[arg(short, long, default_value = "src/models")]
@@ -444,9 +472,9 @@ enum DbCommands {
         force: bool,
     },
 
-    /// Wipe all tables (truncate)
+    /// Drop every table in the database (schema included - this is not a truncate)
     Wipe {
-        /// Also drop all types
+        /// Also drop user-defined enum types (PostgreSQL only; ignored elsewhere)
         #[arg(long)]
         drop_types: bool,
 
@@ -476,30 +504,20 @@ async fn main() {
 
     // Execute command
     let result = match cli.command {
-        Commands::Migrate(cmd) => {
-            commands::migrate::handle_subcommand(&cli.config, cmd, cli.verbose).await
-        }
-        Commands::Make(cmd) => {
-            commands::make::handle(&cli.config, cmd, cli.verbose).await
-        }
-        Commands::Db(cmd) => {
-            commands::db::handle(&cli.config, cmd, cli.verbose).await
-        }
+        // `tideorm migrate` with no subcommand runs pending migrations, which is
+        // what both the crate documentation and the command help advertise.
+        Commands::Migrate { command } => match command {
+            Some(cmd) => commands::migrate::handle_subcommand(&cli.config, cmd, cli.verbose).await,
+            None => commands::migrate::run(&cli.config, None, false, false, None).await,
+        },
+        Commands::Make(cmd) => commands::make::handle(&cli.config, cmd, cli.verbose).await,
+        Commands::Db(cmd) => commands::db::handle(&cli.config, cmd, cli.verbose).await,
         Commands::Init { name, database } => {
             commands::init::run(&name, &database, cli.verbose).await
         }
-        Commands::Config => {
-            commands::config::show(&cli.config, cli.verbose).await
-        }
-        Commands::Models => {
-            commands::models::list(&cli.config, cli.verbose).await
-        }
-        Commands::Schema { table } => {
-            commands::schema::show(&cli.config, table, cli.verbose).await
-        }
-        Commands::Ui { host, port } => {
-            commands::ui::run(&host, port, cli.verbose).await
-        }
+        Commands::Config => commands::config::show(&cli.config, cli.verbose).await,
+        Commands::Models => commands::models::list(&cli.config, cli.verbose).await,
+        Commands::Schema { table } => commands::schema::show(&cli.config, table, cli.verbose).await,
     };
 
     // Handle result
@@ -534,4 +552,58 @@ fn print_banner() {
 "#
         .cyan()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, MakeCommands};
+    use clap::Parser;
+
+    fn model_flags(args: &[&str]) -> (Option<bool>, Option<bool>, Option<bool>) {
+        let cli = Cli::try_parse_from(args).expect("make model should parse");
+
+        match cli.command {
+            Commands::Make(MakeCommands::Model {
+                timestamps,
+                soft_deletes,
+                tokenize,
+                ..
+            }) => (timestamps, soft_deletes, tokenize),
+            _ => panic!("expected a `make model` command"),
+        }
+    }
+
+    /// The `[model]` config can only win when an unsupplied flag is distinguishable from
+    /// one that was passed explicitly, which is what `Option<bool>` buys.
+    #[test]
+    fn model_flags_are_absent_until_supplied() {
+        assert_eq!(
+            model_flags(&["tideorm", "make", "model", "User"]),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn model_flags_record_explicit_values() {
+        assert_eq!(
+            model_flags(&["tideorm", "make", "model", "User", "--timestamps=true"]),
+            (Some(true), None, None)
+        );
+        assert_eq!(
+            model_flags(&["tideorm", "make", "model", "User", "--timestamps=false"]),
+            (Some(false), None, None)
+        );
+        assert_eq!(
+            model_flags(&["tideorm", "make", "model", "User", "--timestamps"]),
+            (Some(true), None, None)
+        );
+        assert_eq!(
+            model_flags(&["tideorm", "make", "model", "User", "--soft-deletes"]),
+            (None, Some(true), None)
+        );
+        assert_eq!(
+            model_flags(&["tideorm", "make", "model", "User", "--tokenize"]),
+            (None, None, Some(true))
+        );
+    }
 }
