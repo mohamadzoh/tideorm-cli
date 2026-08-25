@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Removed `.github/workflows/ci.yml`, added in 0.9.0. Verification is local `cargo test` again.
+
+  It was failing on `generated_project_builds_after_model_generation`, and not for a reason in the
+  CLI's own code: that test scaffolds a project into a tempdir and runs `cargo check --offline`
+  inside it, so every dependency of the *generated* project has to be in the registry cache before
+  the suite starts. The workflow warmed it with `cargo fetch`, which only resolves the CLI's own
+  dependencies — and 0.9.0 narrowed `tokio` from `full` to the features actually used, so
+  `signal-hook-registry` stopped being fetched while the scaffold template still asks for
+  `tokio = { features = ["full"] }`. It passes locally only because a developer's cache already
+  holds it.
+
+  Restoring CI means warming the cache with the scaffold's dependency set rather than the CLI's, or
+  dropping `--offline` from that test.
+
 ## 0.9.0
 
 Breaking: the web UI is gone and the CLI is commands-only.
