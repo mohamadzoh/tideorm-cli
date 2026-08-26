@@ -19,6 +19,13 @@
 //! tideorm db seed
 //! ```
 
+// `db::handle` awaits a chain of TideORM calls in one async fn, and rustc computes the layout of
+// the whole generator as a single type. SeaORM 2.x (via sqlx 0.9) nests deeply enough that this
+// crosses the default limit of 128 — `query depth increased by 130` — and the build fails before
+// any of our own code is at fault. Raising the limit is the documented fix; it costs compile-time
+// budget only, and nothing here recurses at runtime.
+#![recursion_limit = "256"]
+
 mod commands;
 mod config;
 mod generators;

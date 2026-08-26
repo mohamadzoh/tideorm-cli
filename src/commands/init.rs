@@ -18,7 +18,7 @@ static PROMPT_SCRIPT: LazyLock<Mutex<Option<VecDeque<String>>>> =
 ///
 /// Single source of truth: the template and its test both read this, so they cannot drift
 /// apart. Bump it alongside a `tideorm` release.
-const SCAFFOLD_TIDEORM_VERSION: &str = "0.10.0";
+const SCAFFOLD_TIDEORM_VERSION: &str = "0.11.0";
 
 /// Initialize a new TideORM project
 pub async fn run(name: &str, database: &str, verbose: bool) -> Result<(), String> {
