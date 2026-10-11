@@ -208,7 +208,13 @@ impl DatabaseConfig {
     }
 
     fn resolve_with_env(&mut self, env_values: &HashMap<String, String>) {
-        self.driver = expand_env_vars_with_sources(&self.driver, env_values);
+        // Everything downstream matches on "postgres" and "mysql", so the
+        // aliases are folded here; MariaDB takes MySQL's DDL.
+        self.driver = match expand_env_vars_with_sources(&self.driver, env_values).as_str() {
+            "postgresql" => "postgres".to_string(),
+            "mariadb" => "mysql".to_string(),
+            driver => driver.to_string(),
+        };
         self.host = expand_env_vars_with_sources(&self.host, env_values);
         self.database = self
             .database
@@ -550,28 +556,11 @@ fn default_true() -> bool {
 }
 
 /// Seeder configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeederConfig {
-    /// Default seeder class
-    #[serde(default = "default_seeder_class")]
-    pub default_seeder: String,
-
     /// Seeder file template
     #[serde(default)]
     pub template: Option<String>,
-}
-
-impl Default for SeederConfig {
-    fn default() -> Self {
-        Self {
-            default_seeder: default_seeder_class(),
-            template: None,
-        }
-    }
-}
-
-fn default_seeder_class() -> String {
-    "DatabaseSeeder".to_string()
 }
 
 /// Model generation configuration
@@ -663,8 +652,6 @@ impl TideConfig {
             .template
             .as_ref()
             .map(|value| expand_env_vars_with_sources(value, &env_values));
-        config.seeder.default_seeder =
-            expand_env_vars_with_sources(&config.seeder.default_seeder, &env_values);
         config.seeder.template = config
             .seeder
             .template

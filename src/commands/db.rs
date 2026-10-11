@@ -3,10 +3,92 @@
 use crate::DbCommands;
 use crate::config::TideConfig;
 use crate::runtime_db;
-use crate::utils::{confirm_destructive, print_info, print_success, print_warning};
+use crate::utils::{
+    confirm_destructive, package_name, print_info, print_success, print_warning, to_snake_case,
+};
 use colored::Colorize;
-use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The binary target `tideorm db seed` runs; seeders are project code, so only
+/// the project itself can run them. It is named after the package, so two
+/// projects installed with `cargo install` do not collide on it.
+pub(crate) fn seed_runner_bin(package: &str) -> String {
+    format!("{package}-seed")
+}
+
+/// Where `tideorm init` scaffolds that binary, relative to the project root.
+pub(crate) fn seed_runner_path(package: &str) -> String {
+    format!("src/bin/{}.rs", seed_runner_bin(package))
+}
+
+/// How to add the runner to a project `tideorm init` did not scaffold.
+pub(crate) const SEED_RUNNER_SETUP_HINT: &str = "`tideorm db seed` runs your seeders through src/bin/<package>-seed.rs, a binary named after your package that connects TideORM and runs `seeders::all()`. Projects created by `tideorm init` include it; see \"Seeding\" in the tideorm-cli README to add it to this one.";
+
+/// A project's seeder runner, once it is known to build.
+pub(crate) struct SeedRunner {
+    manifest: PathBuf,
+    bin: String,
+}
+
+impl SeedRunner {
+    /// `cargo run` of the runner, before its own arguments. `--manifest-path`
+    /// keeps the working directory, so a relative SQLite path means the same
+    /// file to the runner as to the rest of this CLI.
+    fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("cargo");
+        command
+            .args(["run", "--quiet", "--manifest-path"])
+            .arg(&self.manifest)
+            .args(["--bin", self.bin.as_str(), "--"]);
+        command
+    }
+
+    /// The registered seed `name` refers to: `name` snake-cased, or with
+    /// `_seeder` added, which is how `make seeder` names what it generates
+    /// (`User` finds `user_seeder`). The runner lists its seeds without
+    /// connecting, so a name that matches none is refused before any table is
+    /// touched.
+    pub(crate) fn resolve_seed(&self, name: &str) -> Result<String, String> {
+        let output = self
+            .command()
+            .arg("--list")
+            .output()
+            .map_err(|error| format!("Failed to run cargo: {}", error))?;
+        if !output.status.success() {
+            return Err(format!(
+                "The seeder runner could not list its seeders ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let seeds: Vec<&str> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        pick_seed(&seeds, name)
+    }
+}
+
+/// The seed of `seeds` that `name` refers to; see [`SeedRunner::resolve_seed`].
+fn pick_seed(seeds: &[&str], name: &str) -> Result<String, String> {
+    let snake = to_snake_case(name);
+    let suffixed = format!("{snake}_seeder");
+    [snake, suffixed]
+        .into_iter()
+        .find(|candidate| seeds.contains(&candidate.as_str()))
+        .ok_or_else(|| {
+            if seeds.is_empty() {
+                format!("No seeder named `{name}`: seeders::all() registers none")
+            } else {
+                format!(
+                    "No seeder named `{name}`; the project has: {}",
+                    seeds.join(", ")
+                )
+            }
+        })
+}
 
 /// Handle database subcommands
 pub async fn handle(config_path: &str, cmd: DbCommands, verbose: bool) -> Result<(), String> {
@@ -26,6 +108,10 @@ pub async fn handle(config_path: &str, cmd: DbCommands, verbose: bool) -> Result
 }
 
 /// Run database seeders
+///
+/// Without `seeder`, every seeder that has not run yet runs; with it, that one
+/// seeder runs again. The project's runner binary does the work, against the
+/// database this CLI resolved.
 pub async fn seed(
     config_path: &str,
     seeder: Option<String>,
@@ -38,53 +124,38 @@ pub async fn seed(
         return Err("Cannot run seeders in production without --force flag".to_string());
     }
 
-    let seeders_path = &config.paths.seeders;
+    let runner = ensure_seeding_supported(config_path)?;
+    let seed = seeder
+        .as_deref()
+        .map(|name| runner.resolve_seed(name))
+        .transpose()?;
 
-    if verbose {
-        print_info(&format!("Looking for seeders in: {}", seeders_path));
+    let mut command = runner.command();
+    command.env("DATABASE_URL", config.database.try_connection_url()?);
+    if let Some(seed) = &seed {
+        command.arg(seed);
     }
 
-    // Get seeders to run
-    let seeders = if let Some(seeder_name) = seeder {
-        vec![find_seeder(seeders_path, &seeder_name)?]
-    } else {
-        // Find the default seeder (DatabaseSeeder)
-        let default_seeder = &config.seeder.default_seeder;
-        match find_seeder(seeders_path, default_seeder) {
-            Ok(s) => vec![s],
-            Err(_) => {
-                // Try to find any seeder files
-                get_all_seeders(seeders_path)?
-            }
-        }
-    };
-
-    if seeders.is_empty() {
-        print_warning("No seeders found");
-        return Ok(());
+    if verbose {
+        print_info(&format!(
+            "Running the `{}` binary of {}",
+            runner.bin,
+            runner.manifest.display()
+        ));
     }
 
     println!("\n{}", "Running seeders:".cyan().bold());
     println!("{}", "─".repeat(50));
+    let status = command
+        .status()
+        .map_err(|error| format!("Failed to run cargo: {}", error))?;
+    println!("{}", "─".repeat(50));
 
-    for seeder in &seeders {
-        print!("  Seeding: {}... ", seeder.name);
-
-        // Run the seeder
-        match run_seeder(&config, seeder).await {
-            Ok(count) => {
-                println!("{} ({} records)", "DONE".green(), count);
-            }
-            Err(e) => {
-                println!("{}", "FAILED".red());
-                return Err(format!("Seeder failed: {}", e));
-            }
-        }
+    if !status.success() {
+        return Err(format!("The seeder runner failed ({})", status));
     }
 
-    println!("{}", "─".repeat(50));
-    print_success(&format!("Ran {} seeder(s)", seeders.len()));
-
+    print_success("Seeding complete");
     Ok(())
 }
 
@@ -96,10 +167,10 @@ async fn fresh(config_path: &str, force: bool, verbose: bool) -> Result<(), Stri
         return Err("Cannot run db:fresh in production without --force flag".to_string());
     }
 
-    // db:fresh always re-seeds. Seeding cannot be performed yet, so refuse here
+    // db:fresh always re-seeds, so a project that cannot seed is refused here
     // instead of dropping every table and only then aborting on the seeding
-    // step, which would leave the project with an empty, unseeded database.
-    ensure_seeding_supported().map_err(|reason| {
+    // step, which would leave it with an empty, unseeded database.
+    ensure_seeding_supported(config_path).map_err(|reason| {
         format!(
             "{} Run `tideorm migrate fresh --force` if you only need to drop tables and re-run migrations.",
             reason
@@ -320,7 +391,7 @@ async fn show_table(config_path: &str, table_name: &str, verbose: bool) -> Resul
         print_info(&format!("Getting info for table: {}", table_name));
     }
 
-    let columns = get_table_columns(&config, table_name).await?;
+    let columns = runtime_db::table_columns(&config, table_name).await?;
 
     println!("\n{}", format!("Table: {}", table_name).cyan().bold());
     println!("{}", "─".repeat(80));
@@ -355,7 +426,7 @@ async fn list_tables(config_path: &str, verbose: bool) -> Result<(), String> {
         print_info("Listing all tables...");
     }
 
-    let tables = get_all_tables(&config).await?;
+    let tables = runtime_db::list_tables(&config).await?;
 
     println!("\n{}", "Database Tables:".cyan().bold());
     println!("{}", "─".repeat(50));
@@ -379,32 +450,44 @@ async fn list_tables(config_path: &str, verbose: bool) -> Result<(), String> {
 // HELPER TYPES AND FUNCTIONS
 // =============================================================================
 
-/// Seeder information
-#[derive(Debug, Clone)]
-pub struct Seeder {
-    pub name: String,
-}
-
-/// Column information
-#[derive(Debug, Clone)]
-pub struct ColumnInfo {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-    pub key: Option<String>,
-    pub default: Option<String>,
-}
-
-/// Why the CLI cannot execute project seeders on its own.
-const SEED_RUNNER_UNAVAILABLE: &str = "Running Rust seeders requires an application-side seeder runner; the CLI cannot load project seeder modules directly yet.";
-
-/// Check whether seeders can actually be executed.
+/// The project's seeder runner, once it is known to build.
 ///
-/// Seeding is not something the CLI can perform yet, so this always fails. It
-/// exists so that commands which imply seeding can bail out *before* running a
-/// destructive step instead of wiping the database and aborting afterwards.
-pub(crate) fn ensure_seeding_supported() -> Result<(), String> {
-    Err(SEED_RUNNER_UNAVAILABLE.to_string())
+/// Commands that seed after a destructive step check this first, so a project
+/// without a runner is refused before its tables are dropped.
+pub(crate) fn ensure_seeding_supported(config_path: &str) -> Result<SeedRunner, String> {
+    let root = Path::new(config_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let manifest = root.join("Cargo.toml");
+    let package = package_name(&manifest)
+        .map_err(|reason| format!("No seeder runner: {}. {}", reason, SEED_RUNNER_SETUP_HINT))?;
+
+    let runner_path = root.join(seed_runner_path(&package));
+    if !runner_path.is_file() {
+        return Err(format!(
+            "No seeder runner at {}. {}",
+            runner_path.display(),
+            SEED_RUNNER_SETUP_HINT
+        ));
+    }
+
+    // Built before anything is dropped: a seeder that does not compile would
+    // otherwise only show once the tables were gone.
+    let bin = seed_runner_bin(&package);
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--quiet", "--manifest-path"])
+        .arg(&manifest)
+        .args(["--bin", bin.as_str()])
+        .status()
+        .map_err(|error| format!("Failed to run cargo: {}", error))?;
+    if !status.success() {
+        return Err(format!(
+            "The seeder runner does not build ({}); nothing was changed.",
+            status
+        ));
+    }
+    Ok(SeedRunner { manifest, bin })
 }
 
 /// Resolve the database a `db create` / `db drop` invocation should act on.
@@ -437,60 +520,6 @@ fn drop_types_supported(config: &TideConfig) -> bool {
     matches!(config.database.driver.as_str(), "postgres" | "postgresql")
 }
 
-/// Get all seeders from the seeders directory
-fn get_all_seeders(seeders_path: &str) -> Result<Vec<Seeder>, String> {
-    let path = Path::new(seeders_path);
-
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut seeders = Vec::new();
-
-    for entry in
-        fs::read_dir(path).map_err(|e| format!("Failed to read seeders directory: {}", e))?
-    {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let file_path = entry.path();
-
-        if file_path.extension().is_some_and(|ext| ext == "rs") {
-            let name = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            if name == "mod" {
-                continue;
-            }
-
-            seeders.push(Seeder {
-                name: crate::utils::to_pascal_case(&name),
-            });
-        }
-    }
-
-    seeders.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(seeders)
-}
-
-/// Find a specific seeder
-fn find_seeder(seeders_path: &str, name: &str) -> Result<Seeder, String> {
-    let seeders = get_all_seeders(seeders_path)?;
-    let search_name = crate::utils::to_pascal_case(name);
-
-    seeders
-        .into_iter()
-        .find(|s| s.name == search_name || s.name.contains(&search_name))
-        .ok_or_else(|| format!("Seeder not found: {}", name))
-}
-
-/// Run a seeder
-async fn run_seeder(_config: &TideConfig, _seeder: &Seeder) -> Result<u32, String> {
-    Err(SEED_RUNNER_UNAVAILABLE.to_string())
-}
-
 /// Test database connection
 async fn test_connection(config: &TideConfig) -> Result<(), String> {
     runtime_db::ping(config).await
@@ -511,39 +540,35 @@ async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), String
     runtime_db::wipe_tables(config, drop_types).await
 }
 
-/// Get table columns
-async fn get_table_columns(
-    config: &TideConfig,
-    table_name: &str,
-) -> Result<Vec<ColumnInfo>, String> {
-    runtime_db::table_columns(config, table_name)
-        .await
-        .map(|columns| {
-            columns
-                .into_iter()
-                .map(|column| ColumnInfo {
-                    name: column.name,
-                    data_type: column.data_type,
-                    nullable: column.nullable,
-                    key: column.key,
-                    default: column.default,
-                })
-                .collect()
-        })
-}
-
-/// Get all tables
-async fn get_all_tables(config: &TideConfig) -> Result<Vec<String>, String> {
-    runtime_db::list_tables(config).await
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{check, drop_types_supported};
+    use super::{check, drop_types_supported, pick_seed};
     use crate::config::TideConfig;
     use crate::runtime_db;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_seeder_is_found_by_its_own_name_or_its_model_name() {
+        let seeds = ["database_seeder", "user_seeder", "demo"];
+        assert_eq!(pick_seed(&seeds, "UserSeeder").unwrap(), "user_seeder");
+        assert_eq!(pick_seed(&seeds, "user_seeder").unwrap(), "user_seeder");
+        assert_eq!(pick_seed(&seeds, "User").unwrap(), "user_seeder");
+        // A seed named exactly so wins over one with `_seeder` added.
+        assert_eq!(pick_seed(&seeds, "Demo").unwrap(), "demo");
+
+        let unknown = pick_seed(&seeds, "Nope").unwrap_err();
+        assert!(unknown.contains("No seeder named `Nope`"), "{unknown}");
+        assert!(
+            unknown.contains("database_seeder, user_seeder, demo"),
+            "{unknown}"
+        );
+        assert!(
+            pick_seed(&[], "User")
+                .unwrap_err()
+                .contains("registers none")
+        );
+    }
 
     #[test]
     fn drop_types_is_reported_as_postgres_only() {
@@ -584,6 +609,32 @@ mod tests {
         );
     }
 
+    /// `a_parents` is dropped first, while `b_children` still points at it, so
+    /// the drops need the foreign-key switch of their own session.
+    #[tokio::test]
+    async fn wipe_drops_a_table_other_rows_still_reference() {
+        let fixture = TempDbProject::new();
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let db = runtime_db::connect(&config).await.expect("connect");
+        for sql in [
+            "CREATE TABLE a_parents (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE b_children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES a_parents(id))",
+            "INSERT INTO a_parents (id) VALUES (1)",
+            "INSERT INTO b_children (id, parent_id) VALUES (1, 1)",
+        ] {
+            runtime_db::execute_on_db(&db, sql).await.expect(sql);
+        }
+
+        runtime_db::wipe_tables(&config, false)
+            .await
+            .expect("wipe should drop every table");
+
+        let tables = runtime_db::list_tables(&config)
+            .await
+            .expect("tables should be listed");
+        assert!(tables.is_empty(), "{tables:?}");
+    }
+
     struct TempDbProject {
         _dir: TempDir,
         config_path: String,
@@ -597,7 +648,7 @@ mod tests {
             let config_path = root.join("tideorm.toml");
 
             let config_contents = format!(
-                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"src/migrations\"\nmodels = \"src/models\"\nseeders = \"src/seeders\"\nfactories = \"src/factories\"\nconfig_file = \"src/config.rs\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[seeder]\ndefault_seeder = \"DatabaseSeeder\"\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
+                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"src/migrations\"\nmodels = \"src/models\"\nseeders = \"src/seeders\"\nfactories = \"src/factories\"\nconfig_file = \"src/config.rs\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
                 db_path,
             );
 

@@ -59,9 +59,6 @@ config_file = "src/config.rs"
 table = "_migrations"
 timestamps = true
 
-[seeder]
-default_seeder = "DatabaseSeeder"
-
 [model]
 timestamps = true
 soft_deletes = false
@@ -161,6 +158,7 @@ tideorm make model User --fields="name:string,email:string:unique,age:i32:nullab
 #   string, text, i32, i64, f32, f64, bool, datetime, date, time,
 #   uuid, json, jsonb, decimal, bytes,
 #   int_array, bigint_array, text_array, bool_array, float_array, json_array
+#   (array types are PostgreSQL-only; on SQLite and MySQL store lists as json)
 #   (SQL spellings are accepted as aliases: varchar, tinyint, smallint, int, integer,
 #    bigint, float, double, boolean, timestamp, blob, binary, integer_array,
 #    string_array, boolean_array)
@@ -244,9 +242,9 @@ Moving a seeder or a factory does not move the model it imports: the generated
 ### Database Commands
 
 ```bash
-# Run all seeders
+# Run every seeder that has not run yet (see "Seeding" below)
 tideorm db seed
-tideorm db seed --seeder=UserSeeder   # Run a specific seeder (alias: --class)
+tideorm db seed --seeder=UserSeeder   # Run one seeder again (alias: --class)
 tideorm db seed --force               # Force run in production
 
 # Drop all tables, re-run migrations and re-seed
@@ -283,6 +281,69 @@ Destructive commands (`db drop`, `db wipe`, `db fresh`, `migrate fresh`) prompt 
 confirmation unless `--force` is given. A run that cannot prompt - no terminal, or
 `CI` / `TIDEORM_NONINTERACTIVE` set - fails with a non-zero exit rather than
 reporting a cancellation as success, so pass `--force` in scripts and CI.
+
+### Seeding
+
+Seeders are Rust code in your project, so the CLI runs them through a small binary
+the project owns, named after its package: for `my-app`, `tideorm db seed` is
+`cargo run --bin my-app-seed`, with `DATABASE_URL` set to the database the CLI resolved.
+Without `--seeder` it runs every seeder in `seeders::all()` that has not run yet -
+TideORM records them in the `_seeds` table and orders them by `priority()` and
+`depends_on()`. `--seeder=UserSeeder`, or `--seeder=User`, runs that one seeder again.
+`db fresh`, `migrate fresh --seed` and `migrate refresh --seed` check for the runner,
+and for the seeder `--seeder` names, before dropping or resetting anything.
+
+`tideorm init` lays a new project out for this - the modules live in `src/lib.rs`, so
+both `src/main.rs` and `src/bin/my-app-seed.rs` can use them, and `default-run` keeps
+plain `cargo run` on your app - and `tideorm make seeder` registers each new seeder in
+`seeders::all()`. To add seeding to an existing project:
+
+1. Move the module declarations from `src/main.rs` into `src/lib.rs` (`pub mod config;
+   pub mod models; pub mod seeders; ...`), refer to them from `src/main.rs` as
+   `my_app::config`, and add `default-run = "my-app"` to `[package]`, naming your
+   app's binary: the package name as written, hyphens included.
+2. Give `src/seeders/mod.rs` a registry:
+
+   ```rust
+   use tideorm::prelude::*;
+
+   pub fn all() -> Seeder {
+       Seeder::new()
+           .add(database_seeder::DatabaseSeeder::default())
+   }
+   ```
+
+3. Create `src/bin/my-app-seed.rs`, named after your package so that two projects
+   installed with `cargo install` do not collide. `--list` prints the seeders' names,
+   which the CLI checks `--seeder` against before it changes anything:
+
+   ```rust
+   #[tokio::main]
+   async fn main() -> Result<(), Box<dyn std::error::Error>> {
+       let seeders = my_app::seeders::all();
+       let name = std::env::args().nth(1);
+       if name.as_deref() == Some("--list") {
+           for seed in seeders.names() {
+               println!("{seed}");
+           }
+           return Ok(());
+       }
+
+       my_app::config::connect_tideorm().await?;
+       let result = match name {
+           Some(name) => seeders.run_seed(&name).await?,
+           None => seeders.run().await?,
+       };
+
+       for seed in &result.executed {
+           println!("  ran      {}", seed.name);
+       }
+       for seed in &result.skipped {
+           println!("  skipped  {} (already ran)", seed.name);
+       }
+       Ok(())
+   }
+   ```
 
 ### Utility Commands
 

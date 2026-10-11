@@ -6,7 +6,9 @@ use std::path::Path;
 use tideorm::internal::{ConnectionTrait, OrmStatement as Statement};
 use tideorm::prelude::Database;
 
-pub const DEFAULT_SEEDERS_TABLE: &str = "_seeders";
+/// The ledger TideORM's `Seeder` records runs in, so `db check` creates the
+/// table seeding actually writes.
+pub const DEFAULT_SEEDERS_TABLE: &str = "_seeds";
 
 #[derive(Debug, Clone)]
 pub struct ColumnDetails {
@@ -33,6 +35,28 @@ pub struct ForeignKeyDetails {
 }
 
 pub async fn connect(config: &TideConfig) -> Result<Database, String> {
+    create_sqlite_file(config).await?;
+    Database::connect(&config.database.connection_url())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Connect with a pool of one connection, so every statement shares one
+/// session: `SET FOREIGN_KEY_CHECKS` and `PRAGMA foreign_keys` hold only on
+/// the connection they ran on, and a larger pool may run the next statement
+/// on another.
+async fn connect_single_session(config: &TideConfig) -> Result<Database, String> {
+    create_sqlite_file(config).await?;
+    Database::builder()
+        .url(config.database.connection_url())
+        .max_connections(1)
+        .build()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// A SQLite database is a file, which has to exist before a connection opens.
+async fn create_sqlite_file(config: &TideConfig) -> Result<(), String> {
     if normalized_driver(config) == "sqlite" {
         let sqlite_path = config
             .database
@@ -41,10 +65,7 @@ pub async fn connect(config: &TideConfig) -> Result<Database, String> {
             .unwrap_or("database.db");
         create_database(config, sqlite_path).await?;
     }
-
-    Database::connect(&config.database.connection_url())
-        .await
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 pub async fn ping(config: &TideConfig) -> Result<(), String> {
@@ -122,8 +143,10 @@ pub async fn list_tables(config: &TideConfig) -> Result<Vec<String>, String> {
             "SELECT tablename AS table_name FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
                 .to_string()
         }
+        // Aliased: MySQL 8 labels information_schema columns in upper case, and
+        // an unmatched label made every listing - and so every wipe - empty.
         "mysql" => {
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name"
+            "SELECT table_name AS table_name FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name"
                 .to_string()
         }
         driver => return Err(format!("Unsupported database driver: {}", driver)),
@@ -132,7 +155,7 @@ pub async fn list_tables(config: &TideConfig) -> Result<Vec<String>, String> {
     let rows = query_json(config, &sql).await?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| string_field(&row, &["table_name", "Tables_in_database", "name"]))
+        .filter_map(|row| string_field(&row, &["table_name"]))
         .collect())
 }
 
@@ -222,7 +245,7 @@ pub async fn table_foreign_keys(
 }
 
 pub async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), String> {
-    let db = connect(config).await?;
+    let db = connect_single_session(config).await?;
     let tables = list_tables(config).await?;
 
     match normalized_driver(config) {
@@ -330,16 +353,15 @@ pub async fn ensure_metadata_tables(
     migration_table: &str,
 ) -> Result<(), String> {
     let db = connect(config).await?;
-    ensure_metadata_tables_on_db(&db, config, migration_table).await
+    ensure_metadata_tables_on_db(&db, migration_table).await
 }
 
 pub async fn ensure_metadata_tables_on_db(
     db: &Database,
-    config: &TideConfig,
     migration_table: &str,
 ) -> Result<(), String> {
-    ensure_migration_table_on_db(db, config, migration_table).await?;
-    ensure_seeders_table_on_db(db, config).await
+    ensure_migration_table_on_db(db, migration_table).await?;
+    ensure_seeders_table_on_db(db).await
 }
 
 pub async fn ensure_migration_table(
@@ -347,22 +369,38 @@ pub async fn ensure_migration_table(
     migration_table: &str,
 ) -> Result<(), String> {
     let db = connect(config).await?;
-    ensure_migration_table_on_db(&db, config, migration_table).await
+    ensure_migration_table_on_db(&db, migration_table).await
 }
 
+/// Create the migrations ledger if it is missing, as TideORM's migrator does.
 pub async fn ensure_migration_table_on_db(
     db: &Database,
-    config: &TideConfig,
     migration_table: &str,
 ) -> Result<(), String> {
-    execute_on_db(db, &metadata_table_sql(config, migration_table, true)).await?;
-    Ok(())
+    tideorm::migration::__ensure_migration_ledger(db, migration_table)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-pub async fn ensure_seeders_table_on_db(db: &Database, config: &TideConfig) -> Result<(), String> {
+/// Create the seed ledger if it is missing, as TideORM's seeder does.
+pub async fn ensure_seeders_table_on_db(db: &Database) -> Result<(), String> {
+    tideorm::migration::__ensure_seed_ledger(db)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Forget every seed the ledger records, so the next `db seed` runs them all:
+/// no migration owns the ledger, so it outlives a reset of the tables it
+/// describes.
+pub async fn clear_seed_ledger(config: &TideConfig) -> Result<(), String> {
+    let db = connect(config).await?;
+    ensure_seeders_table_on_db(&db).await?;
     execute_on_db(
-        db,
-        &metadata_table_sql(config, DEFAULT_SEEDERS_TABLE, false),
+        &db,
+        &format!(
+            "DELETE FROM {}",
+            quoted_identifier(config, DEFAULT_SEEDERS_TABLE)
+        ),
     )
     .await?;
     Ok(())
@@ -718,58 +756,10 @@ fn normalized_driver(config: &TideConfig) -> &str {
     }
 }
 
-fn quoted_identifier(config: &TideConfig, identifier: &str) -> String {
+pub(crate) fn quoted_identifier(config: &TideConfig, identifier: &str) -> String {
     match normalized_driver(config) {
         "mysql" => format!("`{}`", identifier.replace('`', "``")),
         _ => format!("\"{}\"", identifier.replace('"', "\"\"")),
-    }
-}
-
-fn metadata_table_sql(config: &TideConfig, table_name: &str, include_version: bool) -> String {
-    let id = quoted_identifier(config, "id");
-    let name = quoted_identifier(config, "name");
-    let applied_at = quoted_identifier(config, "applied_at");
-    let table = quoted_identifier(config, table_name);
-    let version_column = if include_version {
-        format!(
-            ", {} {} NOT NULL UNIQUE",
-            quoted_identifier(config, "version"),
-            metadata_text_type(config)
-        )
-    } else {
-        String::new()
-    };
-
-    match normalized_driver(config) {
-        "mysql" => format!(
-            "CREATE TABLE IF NOT EXISTS {} ({} INT AUTO_INCREMENT PRIMARY KEY{}, {} {} NOT NULL UNIQUE, {} TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            table,
-            id,
-            version_column,
-            name,
-            metadata_text_type(config),
-            applied_at,
-        ),
-        "sqlite" => format!(
-            "CREATE TABLE IF NOT EXISTS {} ({} INTEGER PRIMARY KEY AUTOINCREMENT{}, {} TEXT NOT NULL UNIQUE, {} TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            table, id, version_column, name, applied_at,
-        ),
-        _ => format!(
-            "CREATE TABLE IF NOT EXISTS {} ({} SERIAL PRIMARY KEY{}, {} {} NOT NULL UNIQUE, {} TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-            table,
-            id,
-            version_column,
-            name,
-            metadata_text_type(config),
-            applied_at,
-        ),
-    }
-}
-
-fn metadata_text_type(config: &TideConfig) -> &'static str {
-    match normalized_driver(config) {
-        "sqlite" => "TEXT",
-        _ => "VARCHAR(255)",
     }
 }
 

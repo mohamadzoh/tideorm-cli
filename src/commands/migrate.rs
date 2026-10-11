@@ -345,14 +345,18 @@ async fn migrate_fresh(
         print_warning("This will drop ALL tables and re-run all migrations!");
     }
 
-    // Seeding cannot actually run yet, so refuse before dropping anything rather
+    // A project that cannot seed is refused before anything is dropped, rather
     // than wiping the database and only then failing on the seed step.
     if seed {
-        crate::commands::db::ensure_seeding_supported().map_err(|reason| {
-            format!(
-                "{reason}\nRun `tideorm migrate fresh` without --seed if you only need to drop tables and re-run migrations."
-            )
-        })?;
+        let runner =
+            crate::commands::db::ensure_seeding_supported(config_path).map_err(|reason| {
+                format!(
+                    "{reason}\nRun `tideorm migrate fresh` without --seed if you only need to drop tables and re-run migrations."
+                )
+            })?;
+        if let Some(name) = &seeder {
+            runner.resolve_seed(name)?;
+        }
     }
 
     // Validate the migration set BEFORE dropping anything: a wrong working
@@ -461,12 +465,24 @@ async fn migrate_refresh(
         return Err("Cannot run migrate:refresh in production without --force flag".to_string());
     }
 
+    if seed {
+        crate::commands::db::ensure_seeding_supported(config_path).map_err(|reason| {
+            format!(
+                "{reason}\nRun `tideorm migrate refresh` without --seed if you only need to re-run migrations."
+            )
+        })?;
+    }
+
     if let Some(count) = step {
         migrate_down(config_path, count, None, false, force, verbose).await?;
         migrate_up(config_path, Some(count), None, false, force, verbose).await?;
     } else {
         migrate_reset(config_path, force, false, verbose).await?;
         run(config_path, None, false, true, None).await?;
+        // Every table was emptied, so every seeder runs again.
+        if seed {
+            runtime_db::clear_seed_ledger(&config).await?;
+        }
     }
 
     if seed {
@@ -513,18 +529,14 @@ async fn migrate_mark(
         .iter()
         .any(|ran| ran.version == migration.version);
 
-    let (sql, message) = if unmark {
+    let message = if unmark {
         if !already_applied {
             return Err(format!(
                 "Migration is not recorded as applied: {}",
                 migration.file_name
             ));
         }
-
-        (
-            delete_record_sql(&config, &migration),
-            format!("Marked {} as not applied", migration.file_name),
-        )
+        format!("Marked {} as not applied", migration.file_name)
     } else {
         if already_applied {
             return Err(format!(
@@ -532,16 +544,19 @@ async fn migrate_mark(
                 migration.file_name
             ));
         }
-
-        (
-            insert_record_sql(&config, &migration),
-            format!("Marked {} as applied", migration.file_name),
-        )
+        format!("Marked {} as applied", migration.file_name)
     };
 
     let db = runtime_db::connect(&config).await?;
-    runtime_db::ensure_migration_table_on_db(&db, &config, &config.migration.table).await?;
-    runtime_db::execute_on_db(&db, &sql).await?;
+    tideorm::migration::__mark_migration(
+        &db,
+        &config.migration.table,
+        &migration.version,
+        &migration.name,
+        !unmark,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
     print_warning("No migration SQL was executed - only the migration ledger was changed");
     print_success(&message);
@@ -823,11 +838,11 @@ async fn get_ran_migrations(
 /// and rolling back by version would then revert the wrong migration. Callers
 /// that want newest-first (rollback, history) reverse this list.
 fn migration_records_query(config: &TideConfig, table_name: &str) -> String {
-    let table = quoted_identifier(config, table_name);
-    let id = quoted_identifier(config, "id");
-    let version = quoted_identifier(config, "version");
-    let name = quoted_identifier(config, "name");
-    let applied_at = quoted_identifier(config, "applied_at");
+    let table = runtime_db::quoted_identifier(config, table_name);
+    let id = runtime_db::quoted_identifier(config, "id");
+    let version = runtime_db::quoted_identifier(config, "version");
+    let name = runtime_db::quoted_identifier(config, "name");
+    let applied_at = runtime_db::quoted_identifier(config, "applied_at");
     let applied_at_expr = match config.database.driver.as_str() {
         "mysql" => format!("CAST({} AS CHAR) AS {}", applied_at, applied_at),
         _ => format!("CAST({} AS TEXT) AS {}", applied_at, applied_at),
@@ -1026,23 +1041,30 @@ async fn run_migration_up(config: &TideConfig, migration: &Migration) -> Result<
             migration.file_name
         ));
     }
+    run_sql_migration(config, migration, up_statements, true).await
+}
 
+/// Apply (`apply`) or revert a migration through TideORM's migrator: holding
+/// its lock, with the ledger write in the same transaction as the statements
+/// where the backend's DDL is transactional. A migration another run applied
+/// (or reverted) meanwhile is left alone.
+async fn run_sql_migration(
+    config: &TideConfig,
+    migration: &Migration,
+    statements: Vec<String>,
+    apply: bool,
+) -> Result<(), String> {
     let db = runtime_db::connect(config).await?;
-    runtime_db::ensure_migration_table_on_db(&db, config, &config.migration.table).await?;
-    let insert_sql = insert_record_sql(config, migration);
-
-    db.transaction(|tx| {
-        Box::pin(async move {
-            // Each statement is executed on its own: concatenating them would
-            // produce a single malformed statement.
-            for statement in &up_statements {
-                execute_on_transaction(tx.connection(), statement).await?;
-            }
-            execute_on_transaction(tx.connection(), &insert_sql).await?;
-            Ok(())
-        })
-    })
+    tideorm::migration::__run_sql_migration(
+        &db,
+        &config.migration.table,
+        &migration.version,
+        &migration.name,
+        statements,
+        apply,
+    )
     .await
+    .map(|_| ())
     .map_err(|error| ledger_failure_message(config, migration, error.to_string()))
 }
 
@@ -1062,28 +1084,6 @@ fn ledger_failure_message(config: &TideConfig, migration: &Migration, error: Str
     }
 }
 
-/// SQL that records `migration` in the migration ledger
-fn insert_record_sql(config: &TideConfig, migration: &Migration) -> String {
-    format!(
-        "INSERT INTO {} ({}, {}) VALUES ({}, {})",
-        quoted_identifier(config, &config.migration.table),
-        quoted_identifier(config, "version"),
-        quoted_identifier(config, "name"),
-        sql_string(&migration.version),
-        sql_string(&migration.name)
-    )
-}
-
-/// SQL that removes `migration` from the migration ledger
-fn delete_record_sql(config: &TideConfig, migration: &Migration) -> String {
-    format!(
-        "DELETE FROM {} WHERE {} = {}",
-        quoted_identifier(config, &config.migration.table),
-        quoted_identifier(config, "version"),
-        sql_string(&migration.version)
-    )
-}
-
 /// Run a migration down
 async fn run_migration_down(config: &TideConfig, migration: &Migration) -> Result<(), String> {
     let down_statements = executable_statements(&migration.down_statements);
@@ -1093,49 +1093,12 @@ async fn run_migration_down(config: &TideConfig, migration: &Migration) -> Resul
             migration.file_name
         ));
     }
-
-    let db = runtime_db::connect(config).await?;
-    runtime_db::ensure_migration_table_on_db(&db, config, &config.migration.table).await?;
-    let delete_sql = delete_record_sql(config, migration);
-
-    db.transaction(|tx| {
-        Box::pin(async move {
-            for statement in &down_statements {
-                execute_on_transaction(tx.connection(), statement).await?;
-            }
-            execute_on_transaction(tx.connection(), &delete_sql).await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| ledger_failure_message(config, migration, error.to_string()))
+    run_sql_migration(config, migration, down_statements, false).await
 }
 
 /// Drop all tables in the database
 async fn drop_all_tables(config: &TideConfig) -> Result<(), String> {
     runtime_db::wipe_tables(config, true).await
-}
-
-async fn execute_on_transaction<C>(connection: &C, sql: &str) -> tideorm::Result<()>
-where
-    C: ConnectionTrait,
-{
-    connection
-        .execute_unprepared(sql)
-        .await
-        .map(|_| ())
-        .map_err(|error| tideorm::Error::query(error.to_string()))
-}
-
-fn quoted_identifier(config: &TideConfig, identifier: &str) -> String {
-    match config.database.driver.as_str() {
-        "mysql" => format!("`{}`", identifier.replace('`', "``")),
-        _ => format!("\"{}\"", identifier.replace('"', "\"\"")),
-    }
-}
-
-fn sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -1411,7 +1374,7 @@ mod tests {
             let config_file_path = slash_path(root.join("src").join("config.rs"));
 
             let config_contents = format!(
-                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"{}\"\nmodels = \"{}\"\nseeders = \"{}\"\nfactories = \"{}\"\nconfig_file = \"{}\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[seeder]\ndefault_seeder = \"DatabaseSeeder\"\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
+                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"{}\"\nmodels = \"{}\"\nseeders = \"{}\"\nfactories = \"{}\"\nconfig_file = \"{}\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
                 database_path,
                 migrations_path,
                 models_path,

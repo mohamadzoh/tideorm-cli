@@ -2,10 +2,22 @@
 
 use crate::config::TideConfig;
 use crate::utils::{
-    FieldDefinition, ensure_directory, ensure_writable, escape_ident, migration_timestamp,
-    quote_sql_identifier, render_template, to_snake_case,
+    FieldDefinition, database_type, ensure_directory, ensure_writable, escape_ident,
+    migration_timestamp, quote_sql_identifier, render_template, to_snake_case,
 };
 use serde::Serialize;
+use tideorm::migration::{AlterTableBuilder, DefaultValue, TableBuilder};
+
+/// `sql` with every line indented by `prefix`, to sit inside a generated file.
+fn indent(sql: &str, prefix: &str) -> String {
+    sql.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
 
 /// Migration generator
 pub struct MigrationGenerator<'a> {
@@ -72,7 +84,7 @@ impl<'a> MigrationGenerator<'a> {
         Self::ensure_no_conflicting_migration(directory, &timestamp, &migration_name)?;
 
         // Parse fields
-        let parsed_fields = Self::parse_fields(fields.as_deref())?;
+        let parsed_fields = Self::parse_fields(fields.as_deref(), &self.config.database.driver)?;
 
         let version = if timestamp.is_empty() {
             migration_name.clone()
@@ -107,10 +119,11 @@ impl<'a> MigrationGenerator<'a> {
 
     /// Refuse to generate a migration that could never be applied.
     ///
-    /// Both `version` and `name` are UNIQUE in the migrations table, so two files sharing
-    /// either value can be written but only one of them can ever run. Timestamps carry
-    /// milliseconds, which makes a version clash unlikely, but reusing a name is easy to
-    /// do by accident and is worth reporting at generation time.
+    /// `version` is UNIQUE in the migrations ledger, so two files sharing one can be
+    /// written but only one of them can ever run, and a name picks a migration out for
+    /// `migrate up --migration`, which a second file of that name would make ambiguous.
+    /// Timestamps carry milliseconds, which makes a version clash unlikely, but reusing a
+    /// name is easy to do by accident and is worth reporting at generation time.
     fn ensure_no_conflicting_migration(
         directory: &str,
         timestamp: &str,
@@ -181,49 +194,25 @@ impl<'a> MigrationGenerator<'a> {
         let driver = &self.config.database.driver;
         let quoted_table = self.quote("table", table)?;
 
-        // Generate columns SQL
-        let mut columns = Vec::new();
-
+        // The table is rendered by TideORM's own migration builder, so a generated
+        // migration creates the table `Schema::create_table` would, on every driver.
+        let mut builder = TableBuilder::new(table, database_type(driver));
         if !fields
             .iter()
             .any(|field| field.primary_key || field.name == self.config.model.primary_key)
         {
-            columns.push(self.default_primary_key_sql(driver)?);
+            builder.big_increments(&self.config.model.primary_key);
         }
-
         for field in fields {
-            columns.push(self.build_column_sql(field, driver)?);
+            self.add_column(&mut builder, field, driver)?;
         }
-
-        // Add timestamps
         if include_timestamps {
-            columns.push(format!(
-                "            {} {} NOT NULL DEFAULT {}",
-                self.quote("column", "created_at")?,
-                self.get_timestamp_type(driver),
-                self.get_now_function(driver)
-            ));
-            columns.push(format!(
-                "            {} {} NOT NULL DEFAULT {}",
-                self.quote("column", "updated_at")?,
-                self.get_timestamp_type(driver),
-                self.get_now_function(driver)
-            ));
+            builder.timestamps();
         }
-
         if include_soft_deletes {
-            columns.push(format!(
-                "            {} {} NULL",
-                self.quote("column", "deleted_at")?,
-                self.get_timestamp_type(driver)
-            ));
+            builder.soft_deletes();
         }
-
-        let raw_sql = format!(
-            "        CREATE TABLE IF NOT EXISTS {} (\n{}\n        )",
-            quoted_table,
-            columns.join(",\n")
-        );
+        let raw_sql = indent(&builder.__create_sql(), "        ");
 
         let context = MigrationTemplateContext {
             name: name.to_string(),
@@ -251,40 +240,40 @@ impl<'a> MigrationGenerator<'a> {
     ) -> Result<String, String> {
         let struct_name = to_pascal_case(name);
         let driver = &self.config.database.driver;
-        let quoted_table = self.quote("table", table)?;
+        // Validated here; the builders quote it themselves.
+        self.quote("table", table)?;
 
-        // Generate add column statements
-        let mut up_statements = Vec::new();
-        let mut down_statements = Vec::new();
-
+        let mut up = AlterTableBuilder::new(table, database_type(driver));
+        let mut down = AlterTableBuilder::new(table, database_type(driver));
         for field in fields {
-            let quoted_column = self.quote("column", &field.name)?;
-            let mut col_def = format!("{} {}", quoted_column, field.sql_type(driver));
-
-            if !field.nullable {
-                col_def.push_str(" NOT NULL");
-            }
-
-            if field.unique {
-                col_def.push_str(" UNIQUE");
-            }
-
+            let column = up.add_column(&field.name, field.migration_column_type(driver));
+            let column = if field.nullable {
+                column.nullable()
+            } else {
+                column.not_null()
+            };
+            let column = if field.unique {
+                column.unique()
+            } else {
+                column
+            };
             if let Some(default) = &field.default {
-                col_def.push_str(&format!(" DEFAULT {}", default));
+                column.default(DefaultValue::Raw(default.clone()));
             }
-
-            up_statements.push(format!(
-                "        schema.raw(r#\"ALTER TABLE {} ADD COLUMN {}\"#).await?;",
-                quoted_table, col_def
-            ));
-
-            // The trailing space keeps the quoted column from sitting directly against the
-            // `"#` that closes the raw string literal.
-            down_statements.push(format!(
-                "        schema.raw(r#\"ALTER TABLE {} DROP COLUMN {} \"#).await?;",
-                quoted_table, quoted_column
-            ));
+            down.drop_column(&field.name);
         }
+        let raw_statements = |alter: &AlterTableBuilder| -> Result<Vec<String>, String> {
+            // The trailing space keeps a quoted name from sitting directly against the
+            // `"#` that closes the raw string literal.
+            Ok(alter
+                .__statements()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|statement| format!("        schema.raw(r#\"{} \"#).await?;", statement))
+                .collect())
+        };
+        let up_statements = raw_statements(&up)?;
+        let down_statements = raw_statements(&down)?;
 
         let context = MigrationTemplateContext {
             name: name.to_string(),
@@ -346,7 +335,7 @@ impl<'a> MigrationGenerator<'a> {
         )
     }
 
-    fn parse_fields(fields: Option<&str>) -> Result<Vec<FieldDefinition>, String> {
+    fn parse_fields(fields: Option<&str>, driver: &str) -> Result<Vec<FieldDefinition>, String> {
         let mut parsed_fields = Vec::new();
 
         if let Some(fields_str) = fields {
@@ -356,98 +345,54 @@ impl<'a> MigrationGenerator<'a> {
                     continue;
                 }
 
-                parsed_fields.push(FieldDefinition::parse(field)?);
+                let parsed = FieldDefinition::parse(field)?;
+                parsed.check_driver_support(driver)?;
+                parsed_fields.push(parsed);
             }
         }
 
         Ok(parsed_fields)
     }
 
-    fn build_column_sql(&self, field: &FieldDefinition, driver: &str) -> Result<String, String> {
+    /// Declare `field` on the table `builder` creates.
+    fn add_column(
+        &self,
+        builder: &mut TableBuilder,
+        field: &FieldDefinition,
+        driver: &str,
+    ) -> Result<(), String> {
         // A field carrying the configured primary key name is the table's primary key even
         // without the modifier - the model generator treats it the same way.
         let is_primary_key = field.primary_key || field.name == self.config.model.primary_key;
 
+        if field.auto_increment && !is_primary_key {
+            return Err(format!(
+                "Field '{}' is auto_increment but not the primary key; only a primary key column is numbered by the database",
+                field.name
+            ));
+        }
         if is_primary_key && field.auto_increment {
-            return self.auto_increment_primary_key_sql(&field.name, driver);
+            builder.big_increments(&field.name);
+            return Ok(());
         }
 
-        let mut col_def = format!(
-            "            {} {}",
-            self.quote("column", &field.name)?,
-            field.sql_type(driver)
-        );
-
-        if is_primary_key {
-            col_def.push_str(" PRIMARY KEY");
-        }
-
-        if field.auto_increment {
-            col_def.push_str(self.get_auto_increment(driver));
-        }
-
-        if !field.nullable && !is_primary_key {
-            col_def.push_str(" NOT NULL");
-        }
-
-        if field.unique {
-            col_def.push_str(" UNIQUE");
-        }
-
+        let column = builder.column(&field.name, field.migration_column_type(driver));
+        let column = if is_primary_key {
+            column.primary_key()
+        } else if field.nullable {
+            column.nullable()
+        } else {
+            column.not_null()
+        };
+        let column = if field.unique {
+            column.unique()
+        } else {
+            column
+        };
         if let Some(default) = &field.default {
-            col_def.push_str(&format!(" DEFAULT {}", default));
+            column.default(DefaultValue::Raw(default.clone()));
         }
-
-        Ok(col_def)
-    }
-
-    fn default_primary_key_sql(&self, driver: &str) -> Result<String, String> {
-        self.auto_increment_primary_key_sql(&self.config.model.primary_key, driver)
-    }
-
-    fn auto_increment_primary_key_sql(
-        &self,
-        field_name: &str,
-        driver: &str,
-    ) -> Result<String, String> {
-        let column = self.quote("column", field_name)?;
-
-        Ok(match driver {
-            "postgres" => format!("            {} BIGSERIAL PRIMARY KEY", column),
-            "mysql" => format!("            {} BIGINT PRIMARY KEY AUTO_INCREMENT", column),
-            "sqlite" => format!("            {} INTEGER PRIMARY KEY AUTOINCREMENT", column),
-            _ => format!("            {} BIGINT PRIMARY KEY", column),
-        })
-    }
-
-    /// Get auto increment syntax
-    fn get_auto_increment(&self, driver: &str) -> &'static str {
-        match driver {
-            "postgres" => "", // SERIAL types handle this
-            "mysql" => " AUTO_INCREMENT",
-            "sqlite" => " AUTOINCREMENT",
-            _ => "",
-        }
-    }
-
-    /// Get timestamp type for driver
-    fn get_timestamp_type(&self, driver: &str) -> &'static str {
-        match driver {
-            "postgres" => "TIMESTAMPTZ",
-            "mysql" => "DATETIME",
-            "sqlite" => "TEXT",
-            _ => "TIMESTAMP",
-        }
-    }
-
-    /// Get NOW() function for driver
-    fn get_now_function(&self, driver: &str) -> &'static str {
-        match driver {
-            "postgres" => "NOW()",
-            "mysql" => "NOW()",
-            "sqlite" => "CURRENT_TIMESTAMP",
-            _ => "NOW()",
-        }
+        Ok(())
     }
 
     /// Update mod.rs with new migration
@@ -570,8 +515,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(content.contains("`id` BIGINT PRIMARY KEY AUTO_INCREMENT"));
-        assert!(!content.contains("AUTO_INCREMENT PRIMARY KEY AUTO_INCREMENT"));
+        assert!(content.contains("`id` BIGINT AUTO_INCREMENT"));
+        assert!(content.contains("PRIMARY KEY (`id`)"));
+        assert_eq!(content.matches("AUTO_INCREMENT").count(), 1);
     }
 
     #[test]
@@ -594,8 +540,32 @@ mod tests {
             )
             .unwrap();
 
-        assert!(content.contains("\"custom_id\" INTEGER PRIMARY KEY AUTOINCREMENT"));
+        // An `INTEGER` column that is the whole primary key is SQLite's rowid.
+        assert!(content.contains("\"custom_id\" INTEGER NOT NULL"));
+        assert!(content.contains("PRIMARY KEY (\"custom_id\")"));
         assert!(!content.contains("\"custom_id\" BIGINT"));
+    }
+
+    #[test]
+    fn test_auto_increment_is_refused_on_a_column_that_is_not_the_key() {
+        let mut config = TideConfig::default();
+        config.database.driver = "sqlite".to_string();
+        config.migration.timestamps = false;
+
+        let generator = MigrationGenerator::new(&config);
+        let fields = vec![FieldDefinition::parse("counter:i64:auto_increment").unwrap()];
+        let error = generator
+            .generate_create_table(
+                "create_counters_table",
+                "1",
+                "counters",
+                &fields,
+                false,
+                false,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("only a primary key column"), "{error}");
     }
 
     #[test]
@@ -630,7 +600,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(content.contains("\"id\" INTEGER PRIMARY KEY"));
+        assert!(content.contains("\"id\" INTEGER"));
+        assert!(content.contains("PRIMARY KEY (\"id\")"));
         assert!(!content.contains("BIGSERIAL"));
     }
 
@@ -685,7 +656,8 @@ mod tests {
         assert!(content.contains("\"order\" INTEGER NOT NULL"));
         assert!(content.contains("\"user\" VARCHAR(255) NOT NULL"));
         assert!(content.contains("\"created_at\" TIMESTAMPTZ NOT NULL"));
-        assert!(content.contains("\"deleted_at\" TIMESTAMPTZ NULL"));
+        assert!(content.contains("\"deleted_at\" TIMESTAMPTZ"));
+        assert!(!content.contains("\"deleted_at\" TIMESTAMPTZ NOT NULL"));
         assert!(content.contains("DROP TABLE IF EXISTS \"order\""));
     }
 
@@ -701,7 +673,7 @@ mod tests {
             .generate_alter_table("add_order_to_users", "1", "user", &fields)
             .unwrap();
 
-        assert!(content.contains("ALTER TABLE `user` ADD COLUMN `order` INTEGER"));
+        assert!(content.contains("ALTER TABLE `user` ADD COLUMN `order` INT"));
         assert!(content.contains("ALTER TABLE `user` DROP COLUMN `order`"));
     }
 

@@ -1,9 +1,11 @@
 //! Init command for TideORM CLI
 
+use crate::commands::db::{SEED_RUNNER_SETUP_HINT, seed_runner_path};
 use crate::config::TideConfig;
+use crate::generators::seeder::{SEEDERS_MOD_RS, register_seeder};
 use crate::runtime_db;
 use crate::utils::{
-    confirm, ensure_directory, file_exists, print_info, print_success, print_warning,
+    confirm, ensure_directory, file_exists, package_name, print_info, print_success, print_warning,
 };
 use colored::Colorize;
 use dialoguer::{Input, Password};
@@ -18,7 +20,7 @@ static PROMPT_SCRIPT: LazyLock<Mutex<Option<VecDeque<String>>>> =
 ///
 /// Single source of truth: the template and its test both read this, so they cannot drift
 /// apart. Bump it alongside a `tideorm` release.
-const SCAFFOLD_TIDEORM_VERSION: &str = "0.11.0";
+const SCAFFOLD_TIDEORM_VERSION: &str = "0.14.0";
 
 /// Initialize a new TideORM project
 pub async fn run(name: &str, database: &str, verbose: bool) -> Result<(), String> {
@@ -570,7 +572,7 @@ fn create_project_structure(verbose: bool) -> Result<(), String> {
     let mod_files = [
         ("src/models/mod.rs", "//! Database models\n"),
         ("src/migrations/mod.rs", "//! Database migrations\n"),
-        ("src/seeders/mod.rs", "//! Database seeders\n"),
+        ("src/seeders/mod.rs", SEEDERS_MOD_RS),
         ("src/factories/mod.rs", "//! Model factories\n"),
     ];
 
@@ -605,10 +607,35 @@ fn create_scaffold_files(
         print_success("Created Cargo.toml");
     }
 
-    if !file_exists("src/main.rs") {
-        std::fs::write("src/main.rs", generate_main_rs())
-            .map_err(|error| format!("Failed to create src/main.rs: {}", error))?;
-        print_success("Created src/main.rs");
+    // The seeder runner is a second binary, so the modules live in a library
+    // both binaries use. An existing crate keeps its own layout.
+    let package = package_name(std::path::Path::new("Cargo.toml"));
+    if file_exists("src/main.rs") || file_exists("src/lib.rs") {
+        if !package.is_ok_and(|package| file_exists(&seed_runner_path(&package))) {
+            print_info(SEED_RUNNER_SETUP_HINT);
+        }
+    } else {
+        match package {
+            Ok(package) => {
+                let library = package.replace('-', "_");
+                let runner_path = seed_runner_path(&package);
+                ensure_directory("src/bin")?;
+                for (path, content) in [
+                    ("src/lib.rs", LIB_RS.to_string()),
+                    ("src/main.rs", generate_main_rs(&library)),
+                    (runner_path.as_str(), generate_seed_runner(&library)),
+                ] {
+                    std::fs::write(path, content)
+                        .map_err(|error| format!("Failed to create {}: {}", path, error))?;
+                    print_success(&format!("Created {}", path));
+                }
+                ensure_default_run(&package)?;
+            }
+            Err(reason) => print_warning(&format!(
+                "Not creating src/main.rs: {}. {}",
+                reason, SEED_RUNNER_SETUP_HINT
+            )),
+        }
     }
 
     if !file_exists("src/config.rs") {
@@ -620,17 +647,8 @@ fn create_scaffold_files(
     if !file_exists("src/seeders/database_seeder.rs") {
         std::fs::write("src/seeders/database_seeder.rs", generate_database_seeder())
             .map_err(|error| format!("Failed to create DatabaseSeeder: {}", error))?;
+        register_seeder("src/seeders", "database_seeder", "DatabaseSeeder")?;
         print_success("Created DatabaseSeeder");
-
-        let mod_path = "src/seeders/mod.rs";
-        let mod_content = std::fs::read_to_string(mod_path).unwrap_or_default();
-        if !mod_content.contains("database_seeder") {
-            std::fs::write(
-                mod_path,
-                format!("{}pub mod database_seeder;\n", mod_content),
-            )
-            .map_err(|error| format!("Failed to update mod.rs: {}", error))?;
-        }
     }
 
     Ok(())
@@ -689,9 +707,6 @@ config_file = "src/config.rs"
 table = "_migrations"
 timestamps = true
 
-[seeder]
-default_seeder = "DatabaseSeeder"
-
 [model]
 timestamps = true
 soft_deletes = false
@@ -738,9 +753,6 @@ config_file = "src/config.rs"
 [migration]
 table = "_migrations"
 timestamps = true
-
-[seeder]
-default_seeder = "DatabaseSeeder"
 
 [model]
 timestamps = true
@@ -791,9 +803,6 @@ config_file = "src/config.rs"
 [migration]
 table = "_migrations"
 timestamps = true
-
-[seeder]
-default_seeder = "DatabaseSeeder"
 
 [model]
 timestamps = true
@@ -1025,6 +1034,41 @@ fn infer_package_name(project_path: &std::path::Path) -> String {
         .unwrap_or_else(|| "tideorm_app".to_string())
 }
 
+/// Name the app's binary as `default-run` in a `Cargo.toml` that names none,
+/// now that the crate has the seeder runner too: without it, a plain
+/// `cargo run` cannot tell which binary to start.
+fn ensure_default_run(package_name: &str) -> Result<(), String> {
+    let manifest = std::fs::read_to_string("Cargo.toml")
+        .map_err(|error| format!("Failed to read Cargo.toml: {}", error))?;
+    if manifest
+        .lines()
+        .any(|line| line.trim_start().starts_with("default-run"))
+    {
+        return Ok(());
+    }
+    let Some(header) = manifest.lines().position(|line| line.trim() == "[package]") else {
+        return Ok(());
+    };
+
+    let newline = if manifest.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let entry = format!("default-run = \"{}\"", package_name);
+    let mut lines: Vec<&str> = manifest.lines().collect();
+    lines.insert(header + 1, &entry);
+    let mut updated = lines.join(newline);
+    updated.push_str(newline);
+    std::fs::write("Cargo.toml", updated)
+        .map_err(|error| format!("Failed to update Cargo.toml: {}", error))?;
+    print_success(&format!(
+        "Set default-run = \"{}\" in Cargo.toml",
+        package_name
+    ));
+    Ok(())
+}
+
 fn generate_cargo_toml(package_name: &str, database: &str) -> String {
     let database_feature = match database {
         "sqlite" => "sqlite",
@@ -1037,6 +1081,7 @@ fn generate_cargo_toml(package_name: &str, database: &str) -> String {
 name = "{package_name}"
 version = "0.1.0"
 edition = "2024"
+default-run = "{package_name}"
 
 [dependencies]
 tokio = {{ version = "1", features = ["full"] }}
@@ -1054,28 +1099,69 @@ entity-manager = ["tideorm/entity-manager"]
     )
 }
 
-fn generate_main_rs() -> String {
-    r#"pub mod config;
+const LIB_RS: &str = "pub mod config;
 pub mod factories;
 pub mod migrations;
 pub mod models;
 pub mod seeders;
+";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    config::connect_tideorm().await?;
+fn generate_main_rs(library: &str) -> String {
+    format!(
+        r#"#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {{
+    {library}::config::connect_tideorm().await?;
     println!("TideORM project initialized.");
     Ok(())
-}
+}}
 "#
-    .to_string()
+    )
+}
+
+fn generate_seed_runner(library: &str) -> String {
+    format!(
+        r#"//! Seeder runner: `tideorm db seed` runs this binary.
+//!
+//! With no argument it runs every seeder in `seeders::all()` that has not run
+//! yet; given a seeder name, it runs that seeder again. `--list` prints the
+//! seeders' names, which `tideorm` checks a name against before it changes
+//! anything.
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {{
+    let seeders = {library}::seeders::all();
+    let name = std::env::args().nth(1);
+    if name.as_deref() == Some("--list") {{
+        for seed in seeders.names() {{
+            println!("{{seed}}");
+        }}
+        return Ok(());
+    }}
+
+    {library}::config::connect_tideorm().await?;
+    let result = match name {{
+        Some(name) => seeders.run_seed(&name).await?,
+        None => seeders.run().await?,
+    }};
+
+    for seed in &result.executed {{
+        println!("  ran      {{}}", seed.name);
+    }}
+    for seed in &result.skipped {{
+        println!("  skipped  {{}} (already ran)", seed.name);
+    }}
+    Ok(())
+}}
+"#
+    )
 }
 
 fn generate_database_seeder() -> String {
     r#"//! Database Seeder
 //!
-//! This is the main seeder that runs all other seeders.
-//! Use `tideorm db seed` to run this seeder.
+//! The first seeder `tideorm db seed` runs. Add seed data here, or generate
+//! more seeders with `tideorm make seeder`; each is registered in
+//! `seeders::all()`.
 
 use tideorm::prelude::*;
 
@@ -1089,8 +1175,6 @@ impl Seed for DatabaseSeeder {
     }
 
     async fn run(&self, _db: &Database) -> tideorm::Result<()> {
-        println!("Running database seeders...");
-        println!("Database seeding completed!");
         Ok(())
     }
 }
@@ -1225,6 +1309,70 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(restored_dir, workspace.path());
+    }
+
+    #[tokio::test]
+    async fn run_scaffolds_a_library_with_a_seeder_runner() {
+        let _guard = INIT_TEST_LOCK.lock().await;
+        let workspace = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        unsafe {
+            std::env::set_var("TIDEORM_NONINTERACTIVE", "1");
+        }
+        std::env::set_current_dir(workspace.path()).unwrap();
+
+        let result = run("shop-app", "sqlite", false).await;
+
+        std::env::set_current_dir(&original_dir).unwrap();
+        unsafe {
+            std::env::remove_var("TIDEORM_NONINTERACTIVE");
+        }
+        assert!(result.is_ok(), "init failed: {:?}", result);
+
+        let project = workspace.path().join("shop-app");
+        let read = |path: &str| fs::read_to_string(project.join(path)).unwrap();
+        assert!(read("Cargo.toml").contains("default-run = \"shop_app\""));
+        assert!(read("src/lib.rs").contains("pub mod seeders;"));
+        assert!(read("src/main.rs").contains("shop_app::config::connect_tideorm()"));
+        assert!(read("src/bin/shop_app-seed.rs").contains("shop_app::seeders::all()"));
+        assert!(
+            read("src/seeders/mod.rs")
+                .contains("        .add(database_seeder::DatabaseSeeder::default())")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_names_the_app_as_default_run_in_an_existing_manifest() {
+        let _guard = INIT_TEST_LOCK.lock().await;
+        let workspace = TempDir::new().unwrap();
+        let project = workspace.path().join("existing-app");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"existing-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        unsafe {
+            std::env::set_var("TIDEORM_NONINTERACTIVE", "1");
+        }
+        std::env::set_current_dir(workspace.path()).unwrap();
+
+        let result = run("existing-app", "sqlite", false).await;
+
+        std::env::set_current_dir(&original_dir).unwrap();
+        unsafe {
+            std::env::remove_var("TIDEORM_NONINTERACTIVE");
+        }
+        assert!(result.is_ok(), "init failed: {:?}", result);
+
+        // The seeder runner is a second binary, so a plain `cargo run` needs
+        // to be told which one is the app.
+        let manifest = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+        assert!(
+            manifest.starts_with("[package]\ndefault-run = \"existing-app\"\nname"),
+            "{manifest}"
+        );
     }
 
     #[tokio::test]

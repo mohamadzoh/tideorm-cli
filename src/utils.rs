@@ -4,6 +4,8 @@ use colored::Colorize;
 use minijinja::{AutoEscape, Environment};
 use serde::Serialize;
 use std::path::Path;
+use tideorm::config::DatabaseType;
+use tideorm::migration::ColumnType;
 
 /// Print a success message
 pub fn print_success(message: &str) {
@@ -33,6 +35,21 @@ pub fn ensure_directory(path: &str) -> Result<(), String> {
 /// Check if a file exists
 pub fn file_exists(path: &str) -> bool {
     Path::new(path).exists()
+}
+
+/// The `[package] name` of the Cargo manifest at `manifest`.
+pub fn package_name(manifest: &Path) -> Result<String, String> {
+    let content = std::fs::read_to_string(manifest)
+        .map_err(|error| format!("cannot read {}: {}", manifest.display(), error))?;
+    let parsed: toml::Value = toml::from_str(&content)
+        .map_err(|error| format!("cannot parse {}: {}", manifest.display(), error))?;
+
+    parsed
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} has no [package] name", manifest.display()))
 }
 
 /// Report whether the process is attached to a terminal it can prompt on.
@@ -305,6 +322,15 @@ fn validate_default_value(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The database type a configured driver name stands for.
+pub fn database_type(driver: &str) -> DatabaseType {
+    match driver {
+        "postgres" => DatabaseType::Postgres,
+        "mysql" => DatabaseType::MySQL,
+        _ => DatabaseType::SQLite,
+    }
+}
+
 /// Map a field type name to its Rust type, ignoring nullability.
 ///
 /// Names that are not one of the aliases below are returned unchanged - see
@@ -347,10 +373,12 @@ pub fn rust_type_for_field_type(field_type: &str) -> String {
 /// Modifiers are a closed set and an unknown one is an error, but the type is not: a type
 /// that matches none of the aliases in [`rust_type_for_field_type`] is emitted verbatim as
 /// the Rust type and uppercased as the SQL type. That is the escape hatch for types the
-/// CLI does not model - a domain enum, a `citext` or `vector` column, a `DECIMAL(10, 2)`
-/// with a custom precision - and removing it would be a breaking change for the projects
-/// relying on it. The cost is that a typo such as `count:integer8` is not caught here; it
-/// surfaces as `pub count: integer8` failing to compile in the generated model.
+/// CLI does not model - a `citext` or `vector` column or a `DECIMAL(10, 2)` with a custom
+/// precision in a migration, a `u64` or `NaiveDateTime` in a model - and removing it would
+/// be a breaking change for the projects relying on it. A model only compiles with a type
+/// TideORM can store, so a domain enum is not one of them. The cost is that a typo such as
+/// `count:integer8` is not caught here; it surfaces as `pub count: integer8` failing to
+/// compile in the generated model, with TideORM's list of supported types.
 #[derive(Debug, Clone)]
 pub struct FieldDefinition {
     pub name: String,
@@ -443,48 +471,90 @@ impl FieldDefinition {
         }
     }
 
-    /// Convert to SQL type
+    /// The column type the field's type names, as TideORM's migrations and schema
+    /// sync render it; `None` for a type the CLI passes through.
+    ///
+    /// Only the choice of type lives here. The SQL per backend is TideORM's, so a
+    /// generated migration creates the column sync would: on MySQL a `Uuid` is
+    /// `BINARY(16)`, timestamps keep their microseconds, and text and binary columns
+    /// are the `LONG` kinds; on SQLite a decimal is `REAL`.
+    fn column_type(&self, driver: &str) -> Option<ColumnType> {
+        Some(match self.field_type.to_lowercase().as_str() {
+            "string" | "varchar" => ColumnType::String,
+            // MySQL cannot make a TEXT column unique without a key length.
+            "text" if driver == "mysql" && self.unique => ColumnType::String,
+            "text" => ColumnType::Text,
+            "i8" | "tinyint" | "i16" | "smallint" => ColumnType::SmallInteger,
+            "i32" | "int" | "integer" => ColumnType::Integer,
+            "i64" | "bigint" => ColumnType::BigInteger,
+            "f32" | "float" => ColumnType::Float,
+            "f64" | "double" => ColumnType::Double,
+            "bool" | "boolean" => ColumnType::Boolean,
+            "datetime" | "timestamp" => ColumnType::TimestampTz,
+            "date" => ColumnType::Date,
+            "time" => ColumnType::Time,
+            "uuid" => ColumnType::Uuid,
+            "json" => ColumnType::Json,
+            "jsonb" => ColumnType::Jsonb,
+            "decimal" => ColumnType::Decimal {
+                precision: 19,
+                scale: 4,
+            },
+            "bytes" | "blob" | "binary" => ColumnType::Binary,
+            "int_array" | "integer_array" => ColumnType::IntegerArray,
+            "bigint_array" => ColumnType::BigIntegerArray,
+            "text_array" | "string_array" => ColumnType::TextArray,
+            "bool_array" | "boolean_array" => ColumnType::BooleanArray,
+            "float_array" => ColumnType::DoubleArray,
+            "json_array" => ColumnType::JsonArray,
+            _ => return None,
+        })
+    }
+
+    /// The column type a migration declares the field with.
     ///
     /// A type that matches none of the aliases is uppercased and used as-is, which is the
     /// SQL half of the passthrough documented on [`FieldDefinition`].
-    pub fn sql_type(&self, driver: &str) -> String {
-        match (self.field_type.to_lowercase().as_str(), driver) {
-            ("string" | "varchar", _) => "VARCHAR(255)".to_string(),
-            ("text", _) => "TEXT".to_string(),
-            ("i8" | "tinyint", "mysql") => "TINYINT".to_string(),
-            ("i8" | "tinyint", _) => "SMALLINT".to_string(),
-            ("i16" | "smallint", _) => "SMALLINT".to_string(),
-            ("i32" | "int" | "integer", _) => "INTEGER".to_string(),
-            ("i64" | "bigint", _) => "BIGINT".to_string(),
-            ("f32" | "float", _) => "REAL".to_string(),
-            ("f64" | "double", _) => "DOUBLE PRECISION".to_string(),
-            ("bool" | "boolean", "mysql") => "TINYINT(1)".to_string(),
-            ("bool" | "boolean", _) => "BOOLEAN".to_string(),
-            ("datetime" | "timestamp", "postgres") => "TIMESTAMPTZ".to_string(),
-            ("datetime" | "timestamp", _) => "DATETIME".to_string(),
-            ("date", _) => "DATE".to_string(),
-            ("time", _) => "TIME".to_string(),
-            ("uuid", "postgres") => "UUID".to_string(),
-            ("uuid", _) => "VARCHAR(36)".to_string(),
-            ("json", "postgres") => "JSON".to_string(),
-            ("jsonb", "postgres") => "JSONB".to_string(),
-            ("json" | "jsonb", _) => "TEXT".to_string(),
-            ("decimal", _) => "DECIMAL(19, 4)".to_string(),
-            ("bytes" | "blob" | "binary", "postgres") => "BYTEA".to_string(),
-            ("bytes" | "blob" | "binary", _) => "BLOB".to_string(),
-            ("int_array" | "integer_array", "postgres") => "INTEGER[]".to_string(),
-            ("bigint_array", "postgres") => "BIGINT[]".to_string(),
-            ("text_array" | "string_array", "postgres") => "TEXT[]".to_string(),
-            ("bool_array" | "boolean_array", "postgres") => "BOOLEAN[]".to_string(),
-            ("float_array", "postgres") => "DOUBLE PRECISION[]".to_string(),
-            ("json_array", "postgres") => "JSONB[]".to_string(),
-            (
-                "int_array" | "integer_array" | "bigint_array" | "text_array" | "string_array"
-                | "bool_array" | "boolean_array" | "float_array" | "json_array",
-                _,
-            ) => "TEXT".to_string(),
-            _ => self.field_type.to_uppercase(),
+    pub fn migration_column_type(&self, driver: &str) -> ColumnType {
+        self.column_type(driver)
+            .unwrap_or_else(|| ColumnType::Custom(self.field_type.to_uppercase()))
+    }
+
+    /// Reject a type the configured driver cannot store.
+    ///
+    /// Array fields become `Vec<T>` model fields, and only PostgreSQL has array
+    /// columns: on any other driver the generated model would not compile.
+    pub fn check_driver_support(&self, driver: &str) -> Result<(), String> {
+        let is_array = matches!(
+            self.field_type.to_lowercase().as_str(),
+            "int_array"
+                | "integer_array"
+                | "bigint_array"
+                | "text_array"
+                | "string_array"
+                | "bool_array"
+                | "boolean_array"
+                | "float_array"
+                | "json_array"
+        );
+
+        if is_array && driver != "postgres" {
+            return Err(format!(
+                "Field '{}' is a {}, which only PostgreSQL supports (this project uses {}). Store the list in a `json` field instead.",
+                self.name, self.field_type, driver
+            ));
         }
+
+        if driver == "postgres"
+            && matches!(self.field_type.to_lowercase().as_str(), "i8" | "tinyint")
+        {
+            return Err(format!(
+                "Field '{}' is an i8, which the PostgreSQL driver cannot bind. Use i16 (smallint) instead.",
+                self.name
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -659,7 +729,12 @@ mod tests {
         // Custom types are a documented escape hatch and must survive untouched...
         let field = FieldDefinition::parse("embedding:vector(1536)").unwrap();
         assert_eq!(field.rust_type_for(false), "vector(1536)");
-        assert_eq!(field.sql_type("postgres"), "VECTOR(1536)");
+        assert_eq!(
+            field
+                .migration_column_type("postgres")
+                .to_sql(DatabaseType::Postgres),
+            "VECTOR(1536)"
+        );
 
         // ...but a "type" that could terminate a generated string literal is refused.
         let error = FieldDefinition::parse("evil:foo\"# BAD").unwrap_err();
@@ -667,6 +742,31 @@ mod tests {
 
         let error = FieldDefinition::parse("evil:9lives").unwrap_err();
         assert!(error.contains("must start with a letter"));
+    }
+
+    #[test]
+    fn test_array_fields_are_postgres_only() {
+        let field = FieldDefinition::parse("tags:text_array:nullable").unwrap();
+        assert!(field.check_driver_support("postgres").is_ok());
+        assert_eq!(
+            field
+                .migration_column_type("postgres")
+                .to_sql(DatabaseType::Postgres),
+            "TEXT[]"
+        );
+
+        for driver in ["sqlite", "mysql"] {
+            let error = field.check_driver_support(driver).unwrap_err();
+            assert!(error.contains("only PostgreSQL"), "{}", error);
+            assert!(error.contains("`json`"), "{}", error);
+        }
+
+        assert!(
+            FieldDefinition::parse("meta:json")
+                .unwrap()
+                .check_driver_support("sqlite")
+                .is_ok()
+        );
     }
 
     #[test]

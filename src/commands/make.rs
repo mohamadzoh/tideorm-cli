@@ -128,7 +128,17 @@ async fn make_model(
         attachments_single.as_deref(),
         attachments_multi.as_deref(),
         &config.model.primary_key_type,
-    )?;
+    )?
+    .map(|fields| {
+        with_listed_modifiers(
+            &fields,
+            &[
+                ("nullable", nullable.as_deref()),
+                ("unique", unique.as_deref()),
+                ("indexed", indexed.as_deref()),
+            ],
+        )
+    });
 
     // The migration has to describe the same table the model is bound to.
     let table_name = resolve_table_name(name, table.as_deref());
@@ -197,7 +207,12 @@ async fn make_model(
 
         let seeder_gen = SeederGenerator::new(&config);
         let seeder_name = format!("{}Seeder", name);
-        let seeder_path = seeder_gen.generate(&seeder_name, Some(name.to_string()), 10)?;
+        let seeder_path = seeder_gen.generate_with_fields(
+            &seeder_name,
+            Some(name.to_string()),
+            10,
+            &generator.seed_fields(),
+        )?;
         print_success(&format!("Created seeder: {}", seeder_path));
     }
 
@@ -311,6 +326,30 @@ fn resolve_table_name(model_name: &str, table: Option<&str>) -> String {
     }
 }
 
+/// `fields` with each field a `--nullable`, `--unique` or `--indexed` list
+/// names carrying that modifier, so the migration creates the column the
+/// model is generated for: a nullable field left `NOT NULL` fails the first
+/// insert that leaves it empty.
+fn with_listed_modifiers(fields: &str, lists: &[(&str, Option<&str>)]) -> String {
+    fields
+        .split(',')
+        .map(|field| {
+            let name = field.split(':').next().unwrap_or_default().trim();
+            let mut field = field.to_string();
+            for (modifier, list) in lists {
+                let listed = list.is_some_and(|names| names.split(',').any(|n| n.trim() == name));
+                let present = field.split(':').skip(2).any(|m| m.trim() == *modifier);
+                if listed && !present {
+                    field.push(':');
+                    field.push_str(modifier);
+                }
+            }
+            field
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn prepare_model_migration_fields(
     fields: Option<String>,
     relations: Option<&str>,
@@ -405,6 +444,21 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn listed_modifiers_reach_the_migration_fields() {
+        assert_eq!(
+            super::with_listed_modifiers(
+                "title:string,summary:text,email:string:unique",
+                &[
+                    ("nullable", Some("summary")),
+                    ("unique", Some("email, title")),
+                    ("indexed", None),
+                ],
+            ),
+            "title:string:unique,summary:text:nullable,email:string:unique"
+        );
+    }
 
     #[test]
     fn test_resolve_table_name_honours_explicit_override() {

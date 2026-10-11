@@ -500,8 +500,29 @@ enum DbCommands {
     Tables,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The command futures nest deeply - the MySQL driver most of all - and in a
+    // debug build `db fresh` overflowed the 1 MiB stack Windows gives the main
+    // thread, so the runtime runs on a thread with the 8 MiB Linux defaults to.
+    let finished = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to start the Tokio runtime")
+                .block_on(run())
+        })
+        .expect("failed to start the CLI thread")
+        .join();
+
+    // A panic has already been reported by the thread that panicked.
+    if finished.is_err() {
+        std::process::exit(101);
+    }
+}
+
+async fn run() {
     let cli = Cli::parse();
 
     // Print banner

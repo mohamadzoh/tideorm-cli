@@ -73,6 +73,7 @@ impl<'a> ModelGenerator<'a> {
 
     /// Set fields from string
     pub fn fields(mut self, fields: Option<String>) -> Self {
+        let driver = &self.config.database.driver;
         if let Some(fields_str) = fields {
             for field in fields_str.split(',') {
                 let field = field.trim();
@@ -80,7 +81,9 @@ impl<'a> ModelGenerator<'a> {
                     continue;
                 }
 
-                match FieldDefinition::parse(field) {
+                let parsed = FieldDefinition::parse(field)
+                    .and_then(|parsed| parsed.check_driver_support(driver).map(|()| parsed));
+                match parsed {
                     Ok(parsed) => self.fields.push(parsed),
                     Err(err) => self.parse_errors.push(err),
                 }
@@ -393,6 +396,13 @@ impl<'a> ModelGenerator<'a> {
                 field_attrs.push(format!("default = \"{}\"", default));
             }
 
+            // The migration names the column exactly as the field was given, while the
+            // model derives one by snake-casing the field name, which splits digits off
+            // (`sha256` becomes `sha_256`) and lowercases. Pin any name that could change.
+            if !derives_itself_as_column(&field.name) {
+                field_attrs.push(format!("column = \"{}\"", field.name));
+            }
+
             let rust_type = field.rust_type_for(is_nullable);
 
             fields.push(ModelFieldTemplateContext {
@@ -516,6 +526,19 @@ impl<'a> ModelGenerator<'a> {
             "string" | "varchar" | "text" => "&str".to_string(),
             _ => field.base_rust_type(),
         }
+    }
+
+    /// The declared fields as a generated seeder fills them: a field in the
+    /// `--nullable` list is optional there too.
+    pub fn seed_fields(&self) -> Vec<FieldDefinition> {
+        self.fields
+            .iter()
+            .cloned()
+            .map(|mut field| {
+                field.nullable |= self.nullable.contains(&field.name);
+                field
+            })
+            .collect()
     }
 
     fn generated_fields(&self) -> Vec<FieldDefinition> {
@@ -651,6 +674,13 @@ struct ModelFieldTemplateContext {
     declaration: String,
 }
 
+/// Whether TideORM derives exactly `name` as the column of a field called `name`:
+/// lowercase ASCII words joined by single underscores, with no digits.
+fn derives_itself_as_column(name: &str) -> bool {
+    name.split('_')
+        .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +808,23 @@ mod tests {
         assert!(content.contains("pub user_id: i64,"));
         assert!(content.contains("#[index(\"user_id\")]"));
         assert!(content.contains("pub author: BelongsTo<User>,"));
+    }
+
+    #[test]
+    fn test_field_names_the_model_would_rename_pin_their_column() {
+        let config = TideConfig::default();
+        let content = ModelGenerator::new(&config)
+            .name("Checksum")
+            .fields(Some(
+                "sha256:string,line_1:string,userName:string,file_name:string".to_string(),
+            ))
+            .generate_content()
+            .unwrap();
+
+        assert!(content.contains("#[tideorm(column = \"sha256\")]"));
+        assert!(content.contains("#[tideorm(column = \"line_1\")]"));
+        assert!(content.contains("#[tideorm(column = \"userName\")]"));
+        assert!(!content.contains("column = \"file_name\""));
     }
 
     #[test]
