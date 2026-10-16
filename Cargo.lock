@@ -2775,9 +2775,9 @@ dependencies = [
 
 [[package]]
 name = "tideorm"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46d6d1bc1c620ed97be9b3dae4f9baddce59246e7ff8a46814cf5c66a92d6c65"
+checksum = "a5c4c57466154dd2cf22d0b3573e96c7e988cbd87658b1c9733dcc005625c555"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2799,7 +2799,7 @@ dependencies = [
 
 [[package]]
 name = "tideorm-cli"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -2820,9 +2820,9 @@ dependencies = [
 
 [[package]]
 name = "tideorm-macros"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39d6ff944c91d978f9c9de42f3ca40b637b7b5826594c4d130a7ad78706d9285"
+checksum = "08f521ad662ecf129e4513edbec4ccae2c928587c8f2d50eb7e9831a69be9f39"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",

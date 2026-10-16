@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1
+
+- Track TideORM `0.15.0`. It is breaking for library users (see its changelog); new projects pin
+  it through `SCAFFOLD_TIDEORM_VERSION`. Publish this version only after `tideorm` 0.15.0 is on
+  crates.io, or `tideorm init` scaffolds a dependency that does not resolve.
+- `migrate` on SQLite now holds TideORM's migration lock, a file beside the database, so two runs
+  at once against one database apply each migration once, as they already did on PostgreSQL and
+  MySQL.
+
 ## 0.10.0
 
 Seeding works, new projects are laid out for it, MySQL wipes actually drop tables, and migrations
