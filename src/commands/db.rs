@@ -210,23 +210,21 @@ async fn status(config_path: &str, verbose: bool) -> Result<(), String> {
     println!("  Driver:     {}", config.database.driver.green());
 
     match config.database.driver.as_str() {
-        "sqlite" => {
-            let path = config
-                .database
-                .sqlite_path
-                .as_deref()
-                .unwrap_or("database.db");
-            println!("  Path:       {}", path);
-            let exists = Path::new(path).exists();
-            println!(
-                "  Status:     {}",
-                if exists {
-                    "EXISTS".green()
-                } else {
-                    "NOT FOUND".yellow()
-                }
-            );
-        }
+        "sqlite" => match config.database.sqlite_file() {
+            Some(path) => {
+                println!("  Path:       {}", path);
+                let exists = Path::new(&path).exists();
+                println!(
+                    "  Status:     {}",
+                    if exists {
+                        "EXISTS".green()
+                    } else {
+                        "NOT FOUND".yellow()
+                    }
+                );
+            }
+            None => println!("  Path:       {}", "in memory".green()),
+        },
         _ => {
             println!("  Host:       {}", config.database.host);
             println!(
@@ -249,14 +247,15 @@ async fn status(config_path: &str, verbose: bool) -> Result<(), String> {
 
     // Try to connect
     print!("\n  Connection: ");
-    match test_connection(&config).await {
+    let connection_result = test_connection(&config).await;
+    match &connection_result {
         Ok(()) => println!("{}", "OK".green()),
-        Err(e) => println!("{} ({})", "FAILED".red(), e),
+        Err(error) => println!("{} ({})", "FAILED".red(), error),
     }
 
     println!("{}", "─".repeat(50));
 
-    Ok(())
+    connection_result
 }
 
 /// Initialize TideORM metadata tables for the current database
@@ -343,7 +342,7 @@ async fn drop_database(
 
 /// Wipe all tables by dropping them
 ///
-/// This drops every table, schema included - it is not a `TRUNCATE`. The drop
+/// This drops every table and view, schema included - it is not a `TRUNCATE`. The drop
 /// semantics are load bearing: `migrate fresh` goes through the same
 /// `runtime_db::wipe_tables` and relies on them to rebuild from the migrations.
 async fn wipe(
@@ -494,16 +493,25 @@ pub(crate) fn ensure_seeding_supported(config_path: &str) -> Result<SeedRunner, 
 ///
 /// For SQLite the database *is* a file, so an explicitly supplied name is the
 /// target file path (relative names resolve against the current directory) and
-/// the configured `sqlite_path` is only the fallback for when no name was
-/// given. Other drivers fall back to the configured database name.
+/// the file the connection opens is only the fallback for when no name was
+/// given: the connection URL's file when one is set, `sqlite_path` otherwise.
+/// Other drivers fall back to the configured database name.
 fn resolve_target_database(config: &TideConfig, name: Option<&str>) -> Result<String, String> {
-    let explicit = name.map(str::trim).filter(|value| !value.is_empty());
+    let explicit = match name {
+        Some(value) if value.trim().is_empty() => {
+            return Err("Explicit database name or SQLite path must not be empty".to_string());
+        }
+        Some(value) => Some(value.trim()),
+        None => None,
+    };
 
-    if config.database.driver == "sqlite" {
-        return Ok(explicit
-            .or(config.database.sqlite_path.as_deref())
-            .unwrap_or("database.db")
-            .to_string());
+    if config.database.driver_name() == "sqlite" {
+        return match explicit {
+            Some(path) => Ok(path.to_string()),
+            None => config.database.sqlite_file().ok_or_else(|| {
+                "The configured SQLite database is in memory, so it has no file".to_string()
+            }),
+        };
     }
 
     explicit
@@ -517,7 +525,7 @@ fn resolve_target_database(config: &TideConfig, name: Option<&str>) -> Result<St
 /// Only PostgreSQL has user-defined types for `db wipe` to drop; on the other
 /// backends the flag is inert, so it is reported rather than silently ignored.
 fn drop_types_supported(config: &TideConfig) -> bool {
-    matches!(config.database.driver.as_str(), "postgres" | "postgresql")
+    config.database.driver_name() == "postgres"
 }
 
 /// Test database connection
@@ -535,14 +543,14 @@ async fn drop_db(config: &TideConfig, name: &str) -> Result<(), String> {
     runtime_db::drop_database(config, name).await
 }
 
-/// Drop every table in the database (and, on PostgreSQL, the enum types)
+/// Drop every table and view in the database (and, on PostgreSQL, the enum types)
 async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), String> {
     runtime_db::wipe_tables(config, drop_types).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{check, drop_types_supported, pick_seed};
+    use super::{check, drop_types_supported, pick_seed, resolve_target_database};
     use crate::config::TideConfig;
     use crate::runtime_db;
     use std::fs;
@@ -568,6 +576,16 @@ mod tests {
                 .unwrap_err()
                 .contains("registers none")
         );
+    }
+
+    #[test]
+    fn an_explicit_empty_database_target_does_not_fall_back_to_config() {
+        let mut config = TideConfig::default();
+        config.database.database = Some("production".to_string());
+
+        let error = resolve_target_database(&config, Some("  "))
+            .expect_err("an explicitly empty target must not select the configured database");
+        assert!(error.contains("must not be empty"));
     }
 
     #[test]
@@ -609,6 +627,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_returns_failure_when_sqlite_database_is_missing() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let database_path = dir.path().join("missing.sqlite3");
+        let config_path = dir.path().join("tideorm.toml");
+        let database_url = crate::config::sqlite_connection_url(
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+        );
+        fs::write(
+            &config_path,
+            format!(
+                "[project]\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nurl = {:?}\n",
+                database_url
+            ),
+        )
+        .expect("config should be written");
+
+        assert!(
+            super::status(&slash_path(&config_path), false)
+                .await
+                .is_err()
+        );
+        assert!(!database_path.exists());
+    }
+
     /// `a_parents` is dropped first, while `b_children` still points at it, so
     /// the drops need the foreign-key switch of their own session.
     #[tokio::test]
@@ -633,6 +678,66 @@ mod tests {
             .await
             .expect("tables should be listed");
         assert!(tables.is_empty(), "{tables:?}");
+    }
+
+    /// A view left behind made `migrate fresh` fail on its `CREATE VIEW` after
+    /// every table was already gone.
+    #[tokio::test]
+    async fn wipe_drops_views_too() {
+        let fixture = TempDbProject::new();
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let db = runtime_db::connect(&config).await.expect("connect");
+        for sql in [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            "CREATE VIEW user_names AS SELECT name FROM users",
+        ] {
+            runtime_db::execute_on_db(&db, sql).await.expect(sql);
+        }
+
+        runtime_db::wipe_tables(&config, false)
+            .await
+            .expect("wipe should drop every table and view");
+
+        let left = runtime_db::query_json(&config, "SELECT name FROM sqlite_master")
+            .await
+            .expect("schema should be readable");
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// `db drop` deletes the file the connection URL opens, not `sqlite_path`.
+    #[tokio::test]
+    async fn drop_deletes_the_file_the_connection_url_opens() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let root = dir.path();
+        let real = root.join("real.sqlite3");
+        let decoy = root.join("decoy.sqlite3");
+        fs::write(&real, b"").expect("real database should be created");
+        fs::write(&decoy, b"").expect("decoy should be created");
+
+        let config_path = root.join("tideorm.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[project]\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\nurl = \"${{TIDEORM_TEST_DROP_URL}}\"\n",
+                slash_path(&decoy)
+            ),
+        )
+        .expect("config should be written");
+        fs::write(
+            root.join(".env"),
+            format!(
+                "TIDEORM_TEST_DROP_URL=sqlite:{}?mode=rwc\n",
+                slash_path(&real)
+            ),
+        )
+        .expect("env file should be written");
+
+        super::drop_database(&slash_path(&config_path), None, true, false)
+            .await
+            .expect("drop should succeed");
+
+        assert!(!real.exists(), "the database the URL names must be dropped");
+        assert!(decoy.exists(), "sqlite_path is not the database in use");
     }
 
     struct TempDbProject {

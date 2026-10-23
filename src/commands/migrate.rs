@@ -9,6 +9,7 @@ use colored::Colorize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use syn::spanned::Spanned;
 use tideorm::internal::{ConnectionTrait, OrmStatement as Statement};
 
 /// Run pending migrations
@@ -123,7 +124,17 @@ pub async fn handle_subcommand(
             migration,
             pretend,
             force,
-        } => migrate_down(config_path, step, migration, pretend, force, verbose).await,
+        } => {
+            migrate_down(
+                config_path,
+                step.unwrap_or(1),
+                migration,
+                pretend,
+                force,
+                verbose,
+            )
+            .await
+        }
         MigrateCommands::Redo {
             step,
             pretend,
@@ -266,11 +277,7 @@ async fn migrate_down(
         run_migration_down(&config, &migration).await?;
         print_success(&format!("Rolled back migration: {}", migration_name));
     } else {
-        // `get_ran_migrations` is ordered by application order, so reversing it
-        // yields the most recently applied migrations first.
-        let migrations = get_ran_migrations(&config, &config.paths.migrations).await?;
-        let migrations_to_rollback: Vec<_> =
-            migrations.into_iter().rev().take(step as usize).collect();
+        let migrations_to_rollback = last_applied(&config, step).await?;
 
         if migrations_to_rollback.is_empty() {
             print_info("Nothing to rollback");
@@ -286,11 +293,8 @@ async fn migrate_down(
             return Ok(());
         }
 
-        for migration in &migrations_to_rollback {
-            print!("  Rolling back: {}... ", migration.file_name);
-            run_migration_down(&config, migration).await?;
-            println!("{}", "DONE".green());
-        }
+        ensure_all_roll_back(&migrations_to_rollback, "roll them back")?;
+        roll_back(&config, &migrations_to_rollback).await?;
 
         print_success(&format!(
             "Rolled back {} migration(s)",
@@ -319,12 +323,53 @@ async fn migrate_redo(
         print_info(&format!("Redoing {} migration(s)...", step));
     }
 
-    migrate_down(config_path, step, None, pretend, force, verbose).await?;
-    migrate_up(config_path, Some(step), None, pretend, force, verbose).await?;
-
-    print_success(&format!("Redid {} migration(s)", step));
+    let redone = redo_last(&config, step, pretend).await?;
+    if !pretend && redone > 0 {
+        print_success(&format!("Redid {} migration(s)", redone));
+    }
 
     Ok(())
+}
+
+/// Roll back the last `step` applied migrations, then apply exactly those again,
+/// oldest first; returns how many that was.
+///
+/// `migrate up --step` would apply the first *pending* migrations instead, which are
+/// other ones whenever an older migration is still pending.
+async fn redo_last(config: &TideConfig, step: u32, pretend: bool) -> Result<usize, String> {
+    let migrations = last_applied(config, step).await?;
+
+    if migrations.is_empty() {
+        print_info("Nothing to redo");
+        return Ok(0);
+    }
+
+    // Checked before anything is rolled back: a migration that cannot be rolled back,
+    // or applied again, would otherwise be left half done.
+    ensure_all_roll_back(&migrations, "redo them")?;
+    ensure_all_run_up(&migrations, "redo them")?;
+
+    if pretend {
+        println!("\n{}", "Pretend mode - migrations to redo:".cyan());
+        for migration in &migrations {
+            println!("\n-- Migration: {}\n-- Down:", migration.file_name);
+            println!("{}", migration.down_sql());
+        }
+        for migration in migrations.iter().rev() {
+            println!("\n-- Migration: {}\n-- Up:", migration.file_name);
+            println!("{}", migration.up_sql());
+        }
+        return Ok(migrations.len());
+    }
+
+    roll_back(config, &migrations).await?;
+    for migration in migrations.iter().rev() {
+        print!("  Migrating: {}... ", migration.file_name);
+        run_migration_up(config, migration).await?;
+        println!("{}", "DONE".green());
+    }
+
+    Ok(migrations.len())
 }
 
 /// Drop all tables and re-run all migrations
@@ -371,15 +416,7 @@ async fn migrate_fresh(
         ));
     }
 
-    if let Some(invalid) = migrations
-        .iter()
-        .find(|migration| executable_statements(&migration.up_statements).is_empty())
-    {
-        return Err(format!(
-            "Migration {} does not contain executable SQL in up() - refusing to drop all tables",
-            invalid.file_name
-        ));
-    }
+    ensure_all_run_up(&migrations, "drop all tables")?;
 
     // `--force` is the non-interactive escape hatch, so it must SKIP this prompt
     // rather than be a precondition for reaching it. Without `--force` the drop
@@ -438,13 +475,10 @@ async fn migrate_reset(
         return Ok(());
     }
 
+    let migrations: Vec<_> = migrations.into_iter().rev().collect();
+    ensure_all_roll_back(&migrations, "reset")?;
     println!("Rolling back {} migration(s)...", migrations.len());
-
-    for migration in migrations.iter().rev() {
-        print!("  Rolling back: {}... ", migration.file_name);
-        run_migration_down(&config, migration).await?;
-        println!("{}", "DONE".green());
-    }
+    roll_back(&config, &migrations).await?;
 
     print_success(&format!("Reset {} migration(s)", migrations.len()));
 
@@ -474,15 +508,17 @@ async fn migrate_refresh(
     }
 
     if let Some(count) = step {
-        migrate_down(config_path, count, None, false, force, verbose).await?;
-        migrate_up(config_path, Some(count), None, false, force, verbose).await?;
+        redo_last(&config, count, false).await?;
     } else {
+        // Checked before the reset: a migration that cannot run would leave the
+        // database without the ones after it.
+        ensure_all_run_up(&get_all_migrations(&config.paths.migrations)?, "refresh")?;
         migrate_reset(config_path, force, false, verbose).await?;
         run(config_path, None, false, true, None).await?;
-        // Every table was emptied, so every seeder runs again.
-        if seed {
-            runtime_db::clear_seed_ledger(&config).await?;
-        }
+    }
+
+    if seed {
+        runtime_db::clear_seed_ledger(&config).await?;
     }
 
     if seed {
@@ -655,22 +691,58 @@ pub struct Migration {
     pub file_name: String,
     pub version: String,
     pub name: String,
-    /// One entry per SQL statement found in `up()`, in source order.
-    pub up_statements: Vec<String>,
-    /// One entry per SQL statement found in `down()`, in source order.
-    pub down_statements: Vec<String>,
+    /// One entry per SQL statement found in `up()`, in source order, or why
+    /// the CLI cannot run it.
+    pub up_statements: MethodStatements,
+    /// One entry per SQL statement found in `down()`, in source order, or
+    /// why the CLI cannot run it.
+    pub down_statements: MethodStatements,
+    /// What `foreign_keys_off()` returns, or why the CLI cannot tell.
+    pub foreign_keys_off: Result<bool, String>,
     pub applied_at: Option<String>,
 }
 
 impl Migration {
     /// Rendering of the `up()` statements for display purposes only.
     pub fn up_sql(&self) -> String {
-        render_statements(&self.up_statements)
+        render_method(&self.up_statements)
     }
 
     /// Rendering of the `down()` statements for display purposes only.
     pub fn down_sql(&self) -> String {
-        render_statements(&self.down_statements)
+        render_method(&self.down_statements)
+    }
+
+    /// The statements `up()` runs, or why the CLI cannot run it.
+    fn runnable_up(&self) -> Result<Vec<String>, String> {
+        self.runnable(&self.up_statements, "up")
+    }
+
+    /// The statements `down()` runs, or why the CLI cannot run it.
+    fn runnable_down(&self) -> Result<Vec<String>, String> {
+        self.runnable(&self.down_statements, "down")
+    }
+
+    fn runnable(&self, statements: &MethodStatements, method: &str) -> Result<Vec<String>, String> {
+        let statements = statements
+            .as_ref()
+            .map_err(|reason| format!("Migration {}: {reason}", self.file_name))?;
+        let statements = executable_statements(statements);
+        if statements.is_empty() {
+            return Err(format!(
+                "Migration {} does not contain executable SQL in {method}()",
+                self.file_name
+            ));
+        }
+        Ok(statements)
+    }
+}
+
+/// A method's statements for display, or why the CLI cannot run it.
+fn render_method(statements: &MethodStatements) -> String {
+    match statements {
+        Ok(statements) => render_statements(statements),
+        Err(reason) => format!("-- not runnable by the CLI: {reason}"),
     }
 }
 
@@ -702,16 +774,18 @@ fn render_statements(statements: &[String]) -> String {
 /// Get all migrations from the migrations directory
 fn get_all_migrations(migrations_path: &str) -> Result<Vec<Migration>, String> {
     let path = Path::new(migrations_path);
-
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-
     let mut migrations = Vec::new();
+    let mut migration_files_by_version = HashMap::new();
 
-    for entry in fs::read_dir(path)
-        .map_err(|error| format!("Failed to read migrations directory: {}", error))?
-    {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if utils::is_missing_path(path, &error) => return Ok(vec![]),
+        Err(error) => {
+            return Err(format!("Failed to read migrations directory: {}", error));
+        }
+    };
+
+    for entry in entries {
         let entry = entry.map_err(|error| format!("Failed to read entry: {}", error))?;
         let file_path = entry.path();
 
@@ -729,15 +803,23 @@ fn get_all_migrations(migrations_path: &str) -> Result<Vec<Migration>, String> {
             let content = fs::read_to_string(&file_path)
                 .map_err(|error| format!("Failed to read migration file: {}", error))?;
 
-            let (version, logical_name) = parse_migration_metadata(&name, &content);
-            let (up_statements, down_statements) = parse_migration_content(&content);
-
+            let source = Source::new(&content);
+            let (version, logical_name) = parse_migration_metadata(&name, &source);
+            if let Some(existing_file) =
+                migration_files_by_version.insert(version.clone(), name.clone())
+            {
+                return Err(format!(
+                    "Duplicate migration version '{}': '{}.rs' and '{}.rs' cannot both be applied",
+                    version, existing_file, name
+                ));
+            }
             migrations.push(Migration {
                 file_name: name,
                 version,
                 name: logical_name,
-                up_statements,
-                down_statements,
+                up_statements: method_statements(&source, "up"),
+                down_statements: method_statements(&source, "down"),
+                foreign_keys_off: foreign_keys_off(&source),
                 applied_at: None,
             });
         }
@@ -811,12 +893,14 @@ async fn get_ran_migrations(
             .ok()
             .filter(|value| !value.is_empty());
 
+        let missing = || Err(format!("its file is missing from {migrations_path}"));
         let mut migration = all_by_name.get(&version).cloned().unwrap_or(Migration {
             file_name: version.clone(),
             version: version.clone(),
             name,
-            up_statements: Vec::new(),
-            down_statements: Vec::new(),
+            up_statements: missing(),
+            down_statements: missing(),
+            foreign_keys_off: Ok(false),
             applied_at: None,
         });
 
@@ -843,7 +927,7 @@ fn migration_records_query(config: &TideConfig, table_name: &str) -> String {
     let version = runtime_db::quoted_identifier(config, "version");
     let name = runtime_db::quoted_identifier(config, "name");
     let applied_at = runtime_db::quoted_identifier(config, "applied_at");
-    let applied_at_expr = match config.database.driver.as_str() {
+    let applied_at_expr = match config.database.driver_name() {
         "mysql" => format!("CAST({} AS CHAR) AS {}", applied_at, applied_at),
         _ => format!("CAST({} AS TEXT) AS {}", applied_at, applied_at),
     };
@@ -860,6 +944,11 @@ fn migration_records_query(config: &TideConfig, table_name: &str) -> String {
 /// substring match is accepted only when it identifies exactly one migration -
 /// an ambiguous name is rejected instead of silently picking the first match.
 fn find_migration(migrations_path: &str, name: &str) -> Result<Migration, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Migration name must not be empty".to_string());
+    }
+
     let migrations = get_all_migrations(migrations_path)?;
 
     let mut matches: Vec<Migration> = migrations
@@ -901,27 +990,76 @@ fn find_migration(migrations_path: &str, name: &str) -> Result<Migration, String
     }
 }
 
-fn parse_migration_metadata(file_name: &str, content: &str) -> (String, String) {
-    let version_pattern =
-        regex::Regex::new(r#"fn\s+version\s*\([^)]*\)\s*->\s*&str\s*\{\s*\"([^\"]+)\""#).unwrap();
-    let name_pattern =
-        regex::Regex::new(r#"fn\s+name\s*\([^)]*\)\s*->\s*&str\s*\{\s*\"([^\"]+)\""#).unwrap();
+/// A migration file and what it parses to as Rust.
+struct Source<'a> {
+    content: &'a str,
+    file: Result<syn::File, String>,
+}
 
-    let version = version_pattern
-        .captures(content)
-        .and_then(|captures| captures.get(1))
-        .map(|value| value.as_str().to_string())
+impl<'a> Source<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            content,
+            file: syn::parse_file(content)
+                .map_err(|error| format!("the CLI cannot read the file as Rust: {error}")),
+        }
+    }
+
+    /// The body of the first function named `name`, a method of an `impl`
+    /// block or a free function, in source order; `None` without one.
+    fn function(&self, name: &str) -> Result<Option<&syn::Block>, String> {
+        fn find<'f>(items: &'f [syn::Item], name: &str) -> Option<&'f syn::Block> {
+            items.iter().find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == name => Some(&*function.block),
+                syn::Item::Impl(block) => block.items.iter().find_map(|item| match item {
+                    syn::ImplItem::Fn(method) if method.sig.ident == name => Some(&method.block),
+                    _ => None,
+                }),
+                syn::Item::Mod(module) => module
+                    .content
+                    .as_ref()
+                    .and_then(|(_, items)| find(items, name)),
+                _ => None,
+            })
+        }
+        let file = self.file.as_ref().map_err(Clone::clone)?;
+        Ok(find(&file.items, name))
+    }
+
+    /// The first line of the code `spanned` starts, shortened, for an error.
+    fn snippet(&self, spanned: &impl Spanned) -> String {
+        let start = spanned.span().start();
+        let line = self.content.lines().nth(start.line.saturating_sub(1));
+        let code: String = line.unwrap_or("").chars().skip(start.column).collect();
+        let code = code.trim();
+        match code.char_indices().nth(60) {
+            Some((cut, _)) => format!("{}..", &code[..cut]),
+            None => code.to_string(),
+        }
+    }
+}
+
+fn parse_migration_metadata(file_name: &str, source: &Source) -> (String, String) {
+    let version = method_string_value(source, "version")
         .or_else(|| split_file_name(file_name).map(|(version, _)| version.to_string()))
         .unwrap_or_else(|| file_name.to_string());
 
-    let logical_name = name_pattern
-        .captures(content)
-        .and_then(|captures| captures.get(1))
-        .map(|value| value.as_str().to_string())
+    let logical_name = method_string_value(source, "name")
         .or_else(|| split_file_name(file_name).map(|(_, name)| name.to_string()))
         .unwrap_or_else(|| file_name.to_string());
 
     (version, logical_name)
+}
+
+/// The string a method whose body is a string literal returns.
+fn method_string_value(source: &Source, method: &str) -> Option<String> {
+    match source.function(method).ok()??.stmts.as_slice() {
+        [syn::Stmt::Expr(syn::Expr::Lit(literal), None)] => match &literal.lit {
+            syn::Lit::Str(value) => Some(value.value()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn split_file_name(file_name: &str) -> Option<(&str, &str)> {
@@ -933,114 +1071,182 @@ fn split_file_name(file_name: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Parse migration file content to extract the up/down SQL statements
-fn parse_migration_content(content: &str) -> (Vec<String>, Vec<String>) {
-    let mut up_statements = Vec::new();
-    let mut down_statements = Vec::new();
-
-    let up_pattern = regex::Regex::new(r#"fn\s+up\s*\([^)]*\)[^{]*\{([\s\S]*?)\n\s*\}"#).unwrap();
-    let down_pattern =
-        regex::Regex::new(r#"fn\s+down\s*\([^)]*\)[^{]*\{([\s\S]*?)\n\s*\}"#).unwrap();
-
-    if let Some(captures) = up_pattern.captures(content) {
-        up_statements = extract_sql_from_method(&captures[1]);
+/// What a migration's `foreign_keys_off()` returns: `false` without the method,
+/// or why the CLI, which reads the source rather than running it, cannot tell.
+fn foreign_keys_off(source: &Source) -> Result<bool, String> {
+    let Some(body) = source.function("foreign_keys_off")? else {
+        return Ok(false);
+    };
+    if let [syn::Stmt::Expr(syn::Expr::Lit(literal), None)] = body.stmts.as_slice()
+        && let syn::Lit::Bool(value) = &literal.lit
+    {
+        return Ok(value.value);
     }
-
-    if let Some(captures) = down_pattern.captures(content) {
-        down_statements = extract_sql_from_method(&captures[1]);
-    }
-
-    (up_statements, down_statements)
+    Err(format!(
+        "foreign_keys_off() returns something other than `true` or `false`, which the CLI \
+         cannot evaluate: `{}`. Run such a migration with TideORM's `Migrator` from the \
+         project instead.",
+        body.stmts
+            .first()
+            .map_or_else(String::new, |statement| source.snippet(statement))
+    ))
 }
 
-/// Extract the SQL statements from a migration method body
+/// The SQL of each `schema.raw(..)` statement in the body of `method`, in
+/// source order; none when the file has no such method.
 ///
-/// Statements are read from Rust raw string literals (`r"..."`, `r#"..."#`, and
-/// any other hash count), which is what `schema.raw(..)` calls contain. The
-/// literals are scanned explicitly rather than matched with a regex so that SQL
-/// containing double quoted identifiers is not truncated at the first quote.
-fn extract_sql_from_method(method_body: &str) -> Vec<String> {
-    let bytes = method_body.as_bytes();
+/// The CLI runs a migration by reading its source, not by compiling it, so it
+/// runs these statements and nothing else. A body holding any other code (a
+/// builder call, a loop, a binding) is refused rather than run in part.
+fn method_statements(source: &Source, method: &str) -> MethodStatements {
+    let Some(body) = source.function(method)? else {
+        return Ok(Vec::new());
+    };
     let mut statements = Vec::new();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        // Skip line comments so commented out example SQL is never executed.
-        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
-            index = match method_body[index..].find('\n') {
-                Some(offset) => index + offset + 1,
-                None => break,
-            };
-            continue;
-        }
-
-        if bytes[index] != b'r' || !starts_literal(bytes, index) {
-            index += 1;
-            continue;
-        }
-
-        let mut cursor = index + 1;
-        while cursor < bytes.len() && bytes[cursor] == b'#' {
-            cursor += 1;
-        }
-
-        let hashes = cursor - index - 1;
-
-        if bytes.get(cursor) != Some(&b'"') {
-            index += 1;
-            continue;
-        }
-
-        let content_start = cursor + 1;
-
-        match find_raw_string_end(bytes, content_start, hashes) {
-            Some(content_end) => {
-                statements.push(method_body[content_start..content_end].to_string());
-                index = content_end + 1 + hashes;
+    for (index, statement) in body.stmts.iter().enumerate() {
+        match statement {
+            syn::Stmt::Expr(expression, semicolon) => {
+                if let Some(sql) = raw_statement(source, expression, semicolon.is_some())? {
+                    statements.push(sql);
+                    continue;
+                }
+                if semicolon.is_none() && index + 1 == body.stmts.len() && is_ok_unit(expression) {
+                    continue;
+                }
             }
-            // Unterminated literal: nothing sensible left to scan.
-            None => break,
+            // What a new migration's stub holds until it is written.
+            syn::Stmt::Local(local) if is_unused_schema(local) => continue,
+            _ => {}
         }
+        return Err(format!(
+            "{method}() holds code other than `schema.raw(..)` statements, which the CLI \
+             does not run: `{}`. Run such a migration with TideORM's `Migrator` from the \
+             project instead.",
+            source.snippet(statement)
+        ));
     }
-
-    statements
+    Ok(statements)
 }
 
-/// Whether the byte at `index` can start a literal, i.e. is not part of an identifier
-fn starts_literal(bytes: &[u8], index: usize) -> bool {
-    match index.checked_sub(1) {
-        Some(previous) => !bytes[previous].is_ascii_alphanumeric() && bytes[previous] != b'_',
-        None => true,
+/// What a migration method runs: its SQL statements, or why the CLI cannot
+/// run it.
+type MethodStatements = Result<Vec<String>, String>;
+
+/// The SQL of a `schema.raw(<string literal>).await?;` statement; `None`
+/// when `expression` is no `schema.raw(..)` call.
+fn raw_statement(
+    source: &Source,
+    expression: &syn::Expr,
+    terminated: bool,
+) -> Result<Option<String>, String> {
+    let mut core = expression;
+    while let syn::Expr::Try(syn::ExprTry { expr, .. })
+    | syn::Expr::Await(syn::ExprAwait { base: expr, .. }) = core
+    {
+        core = expr;
     }
+    let syn::Expr::MethodCall(call) = core else {
+        return Ok(None);
+    };
+    if call.method != "raw" || !is_path(&call.receiver, "schema") {
+        return Ok(None);
+    }
+    let sql = match (call.args.len(), call.args.first()) {
+        (
+            1,
+            Some(syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(sql),
+                ..
+            })),
+        ) => sql.value(),
+        _ => {
+            return Err(format!(
+                "`schema.raw(..)` takes a string literal the CLI can read: `{}`",
+                source.snippet(expression)
+            ));
+        }
+    };
+    let awaited = matches!(
+        expression,
+        syn::Expr::Try(syn::ExprTry { expr, .. })
+            if matches!(&**expr, syn::Expr::Await(syn::ExprAwait { base, .. })
+                if matches!(&**base, syn::Expr::MethodCall(_)))
+    );
+    if !awaited || !terminated {
+        return Err(format!(
+            "`schema.raw(..)` must be followed by `.await?;`: `{}`",
+            source.snippet(expression)
+        ));
+    }
+    Ok(Some(sql))
 }
 
-/// Position of the closing quote of a raw string literal opened with `hashes` hashes
-fn find_raw_string_end(bytes: &[u8], start: usize, hashes: usize) -> Option<usize> {
-    let mut index = start;
+/// Whether `expression` is the plain path `name`.
+fn is_path(expression: &syn::Expr, name: &str) -> bool {
+    matches!(expression, syn::Expr::Path(path) if path.qself.is_none() && path.path.is_ident(name))
+}
 
-    while index < bytes.len() {
-        if bytes[index] == b'"' {
-            let tail = bytes.get(index + 1..index + 1 + hashes);
-            if tail.is_some_and(|tail| tail.iter().all(|byte| *byte == b'#')) {
-                return Some(index);
-            }
-        }
+/// Whether `expression` is `Ok(())`.
+fn is_ok_unit(expression: &syn::Expr) -> bool {
+    matches!(expression, syn::Expr::Call(call)
+    if is_path(&call.func, "Ok")
+        && matches!(
+            call.args.iter().collect::<Vec<_>>().as_slice(),
+            [syn::Expr::Tuple(unit)] if unit.elems.is_empty()
+        ))
+}
 
-        index += 1;
+/// Whether `local` is `let _ = schema;`.
+fn is_unused_schema(local: &syn::Local) -> bool {
+    matches!(local.pat, syn::Pat::Wild(_))
+        && local
+            .init
+            .as_ref()
+            .is_some_and(|init| init.diverge.is_none() && is_path(&init.expr, "schema"))
+}
+
+/// The last `step` migrations applied, the most recent first: the ledger is
+/// read in the order they were applied.
+async fn last_applied(config: &TideConfig, step: u32) -> Result<Vec<Migration>, String> {
+    let ran = get_ran_migrations(config, &config.paths.migrations).await?;
+    Ok(ran.into_iter().rev().take(step as usize).collect())
+}
+
+/// Roll `migrations` back in the order given.
+async fn roll_back(config: &TideConfig, migrations: &[Migration]) -> Result<(), String> {
+    for migration in migrations {
+        print!("  Rolling back: {}... ", migration.file_name);
+        run_migration_down(config, migration).await?;
+        println!("{}", "DONE".green());
     }
+    Ok(())
+}
 
-    None
+/// Refuse, before anything changes, to `action` when one of `migrations`
+/// cannot be applied: the ones after it would be left out.
+fn ensure_all_run_up(migrations: &[Migration], action: &str) -> Result<(), String> {
+    for migration in migrations {
+        migration
+            .runnable_up()
+            .map_err(|reason| format!("{reason} - refusing to {action}"))?;
+    }
+    Ok(())
+}
+
+/// Refuse, before anything is rolled back, to `action` several migrations
+/// when one of them cannot be: the newer ones would be left reverted.
+fn ensure_all_roll_back(migrations: &[Migration], action: &str) -> Result<(), String> {
+    for migration in migrations {
+        migration
+            .runnable_down()
+            .map_err(|reason| format!("{reason} - refusing to {action}"))?;
+    }
+    Ok(())
 }
 
 /// Run a migration up
 async fn run_migration_up(config: &TideConfig, migration: &Migration) -> Result<(), String> {
-    let up_statements = executable_statements(&migration.up_statements);
-    if up_statements.is_empty() {
-        return Err(format!(
-            "Migration {} does not contain executable SQL in up()",
-            migration.file_name
-        ));
-    }
+    let up_statements = migration.runnable_up()?;
     run_sql_migration(config, migration, up_statements, true).await
 }
 
@@ -1054,7 +1260,35 @@ async fn run_sql_migration(
     statements: Vec<String>,
     apply: bool,
 ) -> Result<(), String> {
-    let db = runtime_db::connect(config).await?;
+    // SQLite changes foreign key enforcement only outside a transaction, and the
+    // migration runs in one, where `PRAGMA foreign_keys = OFF` does nothing: a
+    // rebuild's `DROP TABLE` then deletes the rows pointing at the table. A migration
+    // asking for them off, through `foreign_keys_off()` as TideORM's `Migrator` reads
+    // it or by turning them off itself, runs on a connection of its own that has them
+    // off before the transaction begins, and fails, rolling back, if a foreign key
+    // then points at no row, as SQLite's own procedure for rebuilding a table checks;
+    // one that already did is refused first. The migration's own pragmas still do
+    // nothing inside the transaction.
+    let foreign_keys_off = config.database.driver_name() == "sqlite"
+        && (migration
+            .foreign_keys_off
+            .clone()
+            .map_err(|reason| format!("Migration {}: {reason}", migration.file_name))?
+            || statements
+                .iter()
+                .any(|statement| tideorm::migration::__disables_foreign_keys(statement)));
+    let (db, statements) = if foreign_keys_off {
+        let db = runtime_db::connect_single_session(config).await?;
+        runtime_db::execute_on_db(&db, "PRAGMA foreign_keys = OFF").await?;
+        let statements = foreign_key_check(FOREIGN_KEYS_ALREADY_BROKEN)
+            .into_iter()
+            .chain(statements)
+            .chain(foreign_key_check(FOREIGN_KEYS_LEFT_BROKEN))
+            .collect();
+        (db, statements)
+    } else {
+        (runtime_db::connect(config).await?, statements)
+    };
     tideorm::migration::__run_sql_migration(
         &db,
         &config.migration.table,
@@ -1068,6 +1302,29 @@ async fn run_sql_migration(
     .map_err(|error| ledger_failure_message(config, migration, error.to_string()))
 }
 
+/// What fails a SQLite migration run with foreign keys off whose database had a
+/// row's foreign key matching no row before it ran.
+const FOREIGN_KEYS_ALREADY_BROKEN: &str = "the database already has a foreign key pointing \
+     at no row: fix it before running a migration with foreign keys off";
+
+/// What fails one that leaves such a row.
+const FOREIGN_KEYS_LEFT_BROKEN: &str = "the migration leaves a foreign key pointing at no row";
+
+/// Statements failing the transaction of a SQLite migration run with foreign keys off
+/// when a row's foreign key matches no row: the insert breaks the check named `failure`.
+fn foreign_key_check(failure: &str) -> [String; 3] {
+    [
+        format!(
+            "CREATE TEMP TABLE tideorm_foreign_key_check (holds INTEGER NOT NULL \
+             CONSTRAINT \"{failure}\" CHECK (holds))"
+        ),
+        "INSERT INTO tideorm_foreign_key_check \
+         SELECT NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check)"
+            .to_string(),
+        "DROP TABLE tideorm_foreign_key_check".to_string(),
+    ]
+}
+
 /// Annotate a failed apply/rollback on backends that cannot roll DDL back.
 ///
 /// MySQL and MariaDB implicitly commit DDL, so the surrounding transaction
@@ -1075,8 +1332,8 @@ async fn run_sql_migration(
 /// schema change is then permanent and unrecorded, which every later run trips
 /// over, so point at the escape hatch that repairs the ledger.
 fn ledger_failure_message(config: &TideConfig, migration: &Migration, error: String) -> String {
-    match config.database.driver.as_str() {
-        "mysql" | "mariadb" => format!(
+    match config.database.driver_name() {
+        "mysql" => format!(
             "{}\nMySQL/MariaDB commit DDL implicitly, so the schema change may have been applied without the migration ledger being updated. If so, reconcile it with `tideorm migrate mark --migration {}` (add --unmark for a rollback).",
             error, migration.file_name
         ),
@@ -1086,13 +1343,7 @@ fn ledger_failure_message(config: &TideConfig, migration: &Migration, error: Str
 
 /// Run a migration down
 async fn run_migration_down(config: &TideConfig, migration: &Migration) -> Result<(), String> {
-    let down_statements = executable_statements(&migration.down_statements);
-    if down_statements.is_empty() {
-        return Err(format!(
-            "Migration {} does not contain executable SQL in down()",
-            migration.file_name
-        ));
-    }
+    let down_statements = migration.runnable_down()?;
     run_sql_migration(config, migration, down_statements, false).await
 }
 
@@ -1103,28 +1354,169 @@ async fn drop_all_tables(config: &TideConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_sql_from_method, generate_migration, migrate_mark, render_statements};
+    use super::{
+        Source, find_migration, generate_migration, get_all_migrations, method_statements,
+        method_string_value, migrate_mark, render_statements,
+    };
     use super::{get_pending_migrations, get_ran_migrations, run, run_migration_down};
     use crate::config::TideConfig;
     use std::fs;
     use tempfile::TempDir;
 
+    fn up_body(body: &str) -> Result<Vec<String>, String> {
+        let content = format!(
+            "impl Migration for M {{\n    async fn up(&self, schema: &mut Schema) -> \
+             tideorm::Result<()> {{\n{body}\n    }}\n\n    async fn down(&self, schema: &mut \
+             Schema) -> tideorm::Result<()> {{\n        Ok(())\n    }}\n}}\n"
+        );
+        method_statements(&Source::new(&content), "up")
+    }
+
+    #[test]
+    fn empty_migration_lookup_does_not_match_every_migration() {
+        let error = find_migration("missing-migrations", "  ")
+            .expect_err("a blank selector must fail before matching migrations");
+        assert!(error.contains("Migration name must not be empty"));
+    }
+
+    #[test]
+    fn migration_discovery_only_treats_a_missing_directory_as_empty() {
+        assert!(get_all_migrations("missing-migrations").unwrap().is_empty());
+
+        let dir = TempDir::new().expect("temp dir should be created");
+        let file_path = dir.path().join("not-a-directory");
+        fs::write(&file_path, "").expect("file should be written");
+
+        let error = get_all_migrations(file_path.to_str().expect("path should be utf-8"))
+            .expect_err("a non-directory migrations path should report its I/O error");
+        assert!(
+            error.contains("Failed to read migrations directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_versions_are_rejected_before_migration_execution() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let version = "20260101000000";
+        let first = TEST_MIGRATION.replace("20260321171859", version);
+        let second = first
+            .replace("create_users_table", "create_posts_table")
+            .replace("CreateUsersTable", "CreatePostsTable")
+            .replace("users", "posts");
+        fs::write(
+            dir.path().join(format!("{version}_create_users_table.rs")),
+            first,
+        )
+        .expect("first migration should be written");
+        fs::write(
+            dir.path().join(format!("{version}_create_posts_table.rs")),
+            second,
+        )
+        .expect("second migration should be written");
+
+        let error = get_all_migrations(dir.path().to_str().expect("path should be utf-8"))
+            .expect_err("duplicate migration versions cannot be applied safely");
+        assert!(error.contains(version), "{error}");
+        assert!(error.contains("create_users_table.rs"), "{error}");
+        assert!(error.contains("create_posts_table.rs"), "{error}");
+    }
+
     #[test]
     fn extracts_every_statement_and_keeps_quoted_identifiers_intact() {
         let body = r####"
         schema.raw(r#"ALTER TABLE "users" ADD COLUMN "a" TEXT"#).await?;
-        schema.raw(r#"ALTER TABLE "users" ADD COLUMN "b" TEXT"#).await?;
+        schema
+            .raw("ALTER TABLE \"users\" ADD COLUMN \"b\" TEXT")
+            .await?;
         // schema.raw(r#"only an example"#).await?;
+        /* schema.raw(r#"also only an example"#).await?; */
+        schema.raw(r#"
+CREATE FUNCTION touch() RETURNS trigger AS $$
+BEGIN
+  NEW.meta := '{"a": {"b": 1}
+}';
+  RETURN NEW;
+END $$ LANGUAGE plpgsql"#).await?;
+        let _ = schema;
+
         Ok(())
     "####;
 
-        assert_eq!(
-            extract_sql_from_method(body),
-            vec![
-                "ALTER TABLE \"users\" ADD COLUMN \"a\" TEXT".to_string(),
-                "ALTER TABLE \"users\" ADD COLUMN \"b\" TEXT".to_string(),
-            ]
+        let statements = up_body(body).unwrap();
+        assert_eq!(statements.len(), 3);
+        assert_eq!(statements[0], "ALTER TABLE \"users\" ADD COLUMN \"a\" TEXT");
+        assert_eq!(statements[1], "ALTER TABLE \"users\" ADD COLUMN \"b\" TEXT");
+        assert!(
+            statements[2].ends_with("END $$ LANGUAGE plpgsql"),
+            "{}",
+            statements[2]
         );
+    }
+
+    #[test]
+    fn ignores_method_examples_in_comments_and_string_literals() {
+        let content = r####"
+        // async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {
+        //     schema.raw(r#"DROP TABLE users"#).await?;
+        //     Ok(())
+        // }
+        const EXAMPLE: &str = r##"async fn up(&self, schema: &mut Schema) {
+            schema.raw(r#"DROP TABLE posts"#).await?;
+        }"##;
+        async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {
+            schema.raw(r#"CREATE TABLE users (id INTEGER)"#).await?;
+            Ok(())
+        }
+        "####;
+
+        assert_eq!(
+            method_statements(&Source::new(content), "up").unwrap(),
+            vec!["CREATE TABLE users (id INTEGER)".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignores_metadata_examples_in_comments() {
+        let content = r####"
+        // fn version(&self) -> &str { "99999999999999" }
+        fn version(&self) -> &str { "20261017000000" }
+        "####;
+
+        assert_eq!(
+            method_string_value(&Source::new(content), "version"),
+            Some("20261017000000".to_string())
+        );
+    }
+
+    /// Code the CLI does not run is refused, never skipped: what follows a
+    /// nested block still counts, and a builder call is not ignored.
+    #[test]
+    fn a_method_holding_other_code_is_refused() {
+        for body in [
+            r####"
+        for sql in [r#"CREATE TABLE a (x INT)"#] {
+            schema.raw(sql).await?;
+        }
+        schema.raw(r#"CREATE INDEX i ON a (x)"#).await?;
+        Ok(())"####,
+            r####"
+        schema.raw(r#"CREATE EXTENSION IF NOT EXISTS pg_trgm"#).await?;
+        schema.create_table("posts", |t| { t.id(); }).await?;
+        Ok(())"####,
+            r####"
+        let example = r#"this is not a migration"#;
+        Ok(())"####,
+            r####"
+        schema.raw(SQL).await?;
+        Ok(())"####,
+        ] {
+            let error = up_body(body).unwrap_err();
+            assert!(
+                error.contains("up()") || error.contains("schema.raw"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1332,6 +1724,370 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
+    /// Versions of the applied and the pending migrations, in that order.
+    async fn applied_and_pending(fixture: &TestProject) -> (Vec<String>, Vec<String>) {
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let versions = |migrations: Vec<super::Migration>| {
+            migrations
+                .into_iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>()
+        };
+        let ran = get_ran_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("ran migrations should load");
+        let pending = get_pending_migrations(&config, fixture.migrations_path())
+            .await
+            .expect("pending migrations should load");
+        (versions(ran), versions(pending))
+    }
+
+    /// Apply all three migrations, then roll the middle one back, so an older migration
+    /// is pending while a newer one is the last applied.
+    async fn project_with_an_older_migration_pending() -> TestProject {
+        let fixture = TestProject::new();
+        fixture.add_table_migration("20260322000000", "posts");
+        fixture.add_table_migration("20260323000000", "tags");
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("migrations should run");
+
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let posts = super::find_migration(fixture.migrations_path(), "create_posts_table")
+            .expect("migration should be found");
+        run_migration_down(&config, &posts)
+            .await
+            .expect("rollback should succeed");
+        fixture
+    }
+
+    /// Rolling several migrations back - `reset`, `redo`, `refresh --step` - checks
+    /// first that every one can be: one with nothing in `down()`, or whose file is
+    /// gone, used to be reached only after the newer ones were reverted, which were
+    /// then left so.
+    #[tokio::test]
+    async fn rolling_back_several_migrations_checks_them_all_first() {
+        let fixture = TestProject::new();
+        fixture.add_table_migration("20260322000000", "posts");
+        fixture.add_table_migration("20260323000000", "tags");
+        let posts = format!(
+            "{}/20260322000000_create_posts_table.rs",
+            fixture.migrations_path()
+        );
+        let source = fs::read_to_string(&posts)
+            .unwrap()
+            .replace("schema.raw(r#\"DROP TABLE IF EXISTS posts\"#).await?;", "");
+        fs::write(&posts, source).unwrap();
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("migrations should run");
+        let applied = vec![
+            "20260321171859".to_string(),
+            "20260322000000".to_string(),
+            "20260323000000".to_string(),
+        ];
+
+        let redo = super::migrate_redo(fixture.config_path(), 2, false, false, false)
+            .await
+            .unwrap_err();
+        assert!(redo.contains("down()"), "{redo}");
+        let refresh = super::migrate_refresh(fixture.config_path(), false, Some(2), false, false)
+            .await
+            .unwrap_err();
+        assert!(refresh.contains("down()"), "{refresh}");
+        let reset = super::migrate_reset(fixture.config_path(), false, false, false)
+            .await
+            .unwrap_err();
+        assert!(reset.contains("down()"), "{reset}");
+        assert_eq!(applied_and_pending(&fixture).await.0, applied);
+
+        fs::remove_file(&posts).unwrap();
+        let reset = super::migrate_reset(fixture.config_path(), false, false, false)
+            .await
+            .unwrap_err();
+        assert!(reset.contains("missing"), "{reset}");
+        assert_eq!(applied_and_pending(&fixture).await.0, applied);
+    }
+
+    /// A unique field added to a SQLite table migrates, its uniqueness enforced, and
+    /// rolls back: SQLite refused the `ADD COLUMN .. UNIQUE` it used to be.
+    #[tokio::test]
+    async fn a_unique_column_added_on_sqlite_migrates_and_rolls_back() {
+        let fixture = TestProject::new();
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("the users table should be created");
+        crate::generators::migration::MigrationGenerator::new(&config)
+            .generate(
+                "add_email_to_users",
+                None,
+                Some("users".to_string()),
+                Some("email:string:nullable:unique".to_string()),
+                false,
+                false,
+            )
+            .expect("the alter migration should be generated");
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("the unique column should be added");
+        let db = crate::runtime_db::connect(&config).await.unwrap();
+        crate::runtime_db::execute_on_db(
+            &db,
+            "INSERT INTO users (name, email) VALUES ('a', 'x@y')",
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::runtime_db::execute_on_db(
+                &db,
+                "INSERT INTO users (name, email) VALUES ('b', 'x@y')"
+            )
+            .await
+            .is_err()
+        );
+        drop(db);
+
+        let added = super::find_migration(fixture.migrations_path(), "add_email_to_users")
+            .expect("migration should be found");
+        run_migration_down(&config, &added)
+            .await
+            .expect("the unique column should be dropped");
+        let columns = crate::runtime_db::query_json(&config, "PRAGMA table_info(users)")
+            .await
+            .unwrap();
+        assert!(
+            columns.iter().all(|column| column["name"] != "email"),
+            "{columns:?}"
+        );
+    }
+
+    /// A SQLite migration opening with `PRAGMA foreign_keys = OFF` rebuilds a table
+    /// with foreign keys off, as SQLite's own procedure does: inside the migration's
+    /// transaction the pragma did nothing, and the rebuild's `DROP TABLE` deleted the
+    /// rows pointing at the table. One that leaves a foreign key pointing at no row is
+    /// rolled back, in whichever form it turns them off.
+    #[tokio::test]
+    async fn a_migration_turning_foreign_keys_off_keeps_the_rows_pointing_at_a_rebuilt_table() {
+        let fixture = TestProject::new();
+        fixture.add_parents_and_children(None);
+        fixture.add_migration(
+            "20260323000000",
+            "rebuild_parents",
+            None,
+            r###"        schema.raw(r#"PRAGMA foreign_keys = OFF"#).await?;
+        schema.raw(r#"CREATE TABLE parents_new (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"#).await?;
+        schema.raw(r#"INSERT INTO parents_new SELECT id, name FROM parents"#).await?;
+        schema.raw(r#"DROP TABLE parents"#).await?;
+        schema.raw(r#"ALTER TABLE parents_new RENAME TO parents"#).await?;
+        schema.raw(r#"PRAGMA foreign_keys = ON"#).await?;"###,
+        );
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("migrations should run");
+        assert_eq!(row_count(&config, "children").await, 2);
+
+        fixture.add_migration(
+            "20260324000000",
+            "orphan_children",
+            None,
+            r###"        schema.raw(r#"PRAGMA foreign_keys = OFF"#).await?;
+        schema.raw(r#"DELETE FROM parents WHERE id = 2"#).await?;"###,
+        );
+        let error = run(fixture.config_path(), None, false, true, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("pointing at no row"), "{error}");
+        assert_eq!(row_count(&config, "parents").await, 2);
+        assert_eq!(row_count(&config, "children").await, 2);
+
+        // The same rebuild as one script, turning foreign keys off another way.
+        fs::remove_file(format!(
+            "{}/20260324000000_orphan_children.rs",
+            fixture.migrations_path()
+        ))
+        .expect("the failed migration should be removed");
+        fixture.add_migration(
+            "20260325000000",
+            "rebuild_parents_again",
+            None,
+            r###"        schema.raw(r#"PRAGMA main.foreign_keys(0); CREATE TABLE parents_new (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO parents_new SELECT id, name FROM parents; DROP TABLE parents; ALTER TABLE parents_new RENAME TO parents"#).await?;"###,
+        );
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("the scripted rebuild should run");
+        assert_eq!(row_count(&config, "parents").await, 2);
+        assert_eq!(row_count(&config, "children").await, 2);
+        // The project's own connections still enforce foreign keys.
+        let db = crate::runtime_db::connect(&config).await.unwrap();
+        assert!(
+            crate::runtime_db::execute_on_db(&db, "INSERT INTO children VALUES (3, 99)")
+                .await
+                .is_err()
+        );
+    }
+
+    /// A migration returning `true` from `foreign_keys_off()` runs with foreign keys
+    /// off, as TideORM's `Migrator` runs it: the CLI only read a `PRAGMA foreign_keys`
+    /// statement, so the rebuild's `DROP TABLE` deleted the rows pointing at the
+    /// table. A body the CLI cannot read is refused, and rows that already pointed at
+    /// no row are reported as the database's rather than the migration's.
+    #[tokio::test]
+    async fn a_migration_returning_true_from_foreign_keys_off_runs_with_them_off() {
+        let fixture = TestProject::new();
+        fixture.add_parents_and_children(Some("false"));
+        let rebuild = r###"        schema.raw(r#"CREATE TABLE parents_new (id INTEGER PRIMARY KEY, name TEXT)"#).await?;
+        schema.raw(r#"INSERT INTO parents_new SELECT id, name FROM parents"#).await?;
+        schema.raw(r#"DROP TABLE parents"#).await?;
+        schema.raw(r#"ALTER TABLE parents_new RENAME TO parents"#).await?;"###;
+        fixture.add_migration("20260323000000", "rebuild_parents", Some("true"), rebuild);
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("migrations should run");
+        assert_eq!(row_count(&config, "children").await, 2);
+
+        let unreadable = format!(
+            "{}/20260324000000_rebuild_unread.rs",
+            fixture.migrations_path()
+        );
+        fixture.add_migration(
+            "20260324000000",
+            "rebuild_unread",
+            Some("std::env::var(\"REBUILD\").is_ok()"),
+            rebuild,
+        );
+        let error = run(fixture.config_path(), None, false, true, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("foreign_keys_off()"), "{error}");
+        assert_eq!(row_count(&config, "children").await, 2);
+        fs::remove_file(unreadable).expect("the refused migration should be removed");
+
+        let db = crate::runtime_db::connect_single_session(&config)
+            .await
+            .unwrap();
+        crate::runtime_db::execute_on_db(&db, "PRAGMA foreign_keys = OFF")
+            .await
+            .unwrap();
+        crate::runtime_db::execute_on_db(&db, "INSERT INTO children VALUES (3, 77)")
+            .await
+            .unwrap();
+        drop(db);
+        fixture.add_migration(
+            "20260325000000",
+            "rebuild_parents_again",
+            Some("true"),
+            rebuild,
+        );
+        let error = run(fixture.config_path(), None, false, true, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("already has a foreign key pointing at no row"),
+            "{error}"
+        );
+        assert_eq!(row_count(&config, "children").await, 3);
+    }
+
+    /// `redo` used to roll back the last migration and then apply the first pending
+    /// one, which was another migration.
+    #[tokio::test]
+    async fn redo_reapplies_the_migrations_it_rolled_back() {
+        let fixture = project_with_an_older_migration_pending().await;
+
+        super::migrate_redo(fixture.config_path(), 1, false, false, false)
+            .await
+            .expect("redo should succeed");
+
+        assert_eq!(
+            applied_and_pending(&fixture).await,
+            (
+                vec!["20260321171859".to_string(), "20260323000000".to_string()],
+                vec!["20260322000000".to_string()]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_with_step_reapplies_the_migrations_it_rolled_back() {
+        let fixture = project_with_an_older_migration_pending().await;
+
+        super::migrate_refresh(fixture.config_path(), false, Some(1), false, false)
+            .await
+            .expect("refresh should succeed");
+
+        assert_eq!(
+            applied_and_pending(&fixture).await,
+            (
+                vec!["20260321171859".to_string(), "20260323000000".to_string()],
+                vec!["20260322000000".to_string()]
+            )
+        );
+    }
+
+    /// `make migration` with `:indexed` fields creates the index the model declares,
+    /// and the rollback drops it ahead of the column SQLite would refuse to drop.
+    #[tokio::test]
+    async fn generated_indexes_are_created_and_rolled_back() {
+        let fixture = TestProject::new();
+        let config = TideConfig::load(fixture.config_path()).expect("config should load");
+        let generator = crate::generators::migration::MigrationGenerator::new(&config);
+        generator
+            .generate(
+                "create_posts_table",
+                Some("posts".to_string()),
+                None,
+                Some("title:string,user_id:i64:indexed".to_string()),
+                false,
+                false,
+            )
+            .expect("create migration should be generated");
+        // Versions are millisecond timestamps, and two in one millisecond collide.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        generator
+            .generate(
+                "add_slug_to_posts",
+                None,
+                Some("posts".to_string()),
+                Some("slug:string:nullable:indexed".to_string()),
+                false,
+                false,
+            )
+            .expect("alter migration should be generated");
+
+        run(fixture.config_path(), None, false, true, None)
+            .await
+            .expect("migrations should run");
+
+        let indexes = || async {
+            crate::runtime_db::table_indexes(&config, "posts")
+                .await
+                .expect("indexes should be listed")
+                .into_iter()
+                .map(|index| index.name)
+                .collect::<Vec<_>>()
+        };
+        let created = indexes().await;
+        assert!(
+            created.contains(&"idx_posts_user_id".to_string()),
+            "{created:?}"
+        );
+        assert!(
+            created.contains(&"idx_posts_slug".to_string()),
+            "{created:?}"
+        );
+
+        super::migrate_down(fixture.config_path(), 1, None, false, false, false)
+            .await
+            .expect("the alter migration should roll back");
+        assert!(!indexes().await.contains(&"idx_posts_slug".to_string()));
+    }
+
     #[tokio::test]
     async fn generate_reports_a_broken_config_instead_of_defaulting_to_postgres() {
         let dir = TempDir::new().expect("temp dir should be created");
@@ -1407,6 +2163,66 @@ mod tests {
         fn migrations_path(&self) -> &str {
             &self.migrations_path
         }
+
+        /// Add a migration creating `table`, as `<version>_create_<table>_table.rs`.
+        fn add_table_migration(&self, version: &str, table: &str) {
+            let source = TEST_MIGRATION
+                .replace("20260321171859", version)
+                .replace("users", table);
+            fs::write(
+                format!(
+                    "{}/{}_create_{}_table.rs",
+                    self.migrations_path, version, table
+                ),
+                source,
+            )
+            .expect("migration should be written");
+        }
+
+        /// Add a migration of `version` and `name` whose `up()` runs `up`, a
+        /// body of `schema.raw(..)` statements, and whose `foreign_keys_off()`,
+        /// when there is one, returns `foreign_keys_off`.
+        fn add_migration(
+            &self,
+            version: &str,
+            name: &str,
+            foreign_keys_off: Option<&str>,
+            up: &str,
+        ) {
+            let foreign_keys_off = foreign_keys_off.map_or_else(String::new, |value| {
+                format!("    fn foreign_keys_off(&self) -> bool {{\n        {value}\n    }}\n\n")
+            });
+            let source = format!(
+                "use tideorm::prelude::*;\n\npub struct M;\n\n#[async_trait]\nimpl Migration for M {{\n    fn version(&self) -> &str {{\n        \"{version}\"\n    }}\n\n    fn name(&self) -> &str {{\n        \"{name}\"\n    }}\n\n{foreign_keys_off}    async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {{\n{up}\n        Ok(())\n    }}\n\n    async fn down(&self, _schema: &mut Schema) -> tideorm::Result<()> {{\n        Ok(())\n    }}\n}}\n"
+            );
+            fs::write(
+                format!("{}/{version}_{name}.rs", self.migrations_path),
+                source,
+            )
+            .expect("migration should be written");
+        }
+
+        /// Add the migration creating `parents` and `children`, two rows each,
+        /// every child pointing at a parent.
+        fn add_parents_and_children(&self, foreign_keys_off: Option<&str>) {
+            self.add_migration(
+                "20260322000000",
+                "create_parents_and_children",
+                foreign_keys_off,
+                r###"        schema.raw(r#"CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT)"#).await?;
+        schema.raw(r#"CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents (id) ON DELETE CASCADE)"#).await?;
+        schema.raw(r#"INSERT INTO parents VALUES (1, 'p'), (2, 'q')"#).await?;
+        schema.raw(r#"INSERT INTO children VALUES (1, 1), (2, 2)"#).await?;"###,
+            );
+        }
+    }
+
+    /// The number of rows in `table`.
+    async fn row_count(config: &TideConfig, table: &str) -> usize {
+        crate::runtime_db::query_json(config, &format!("SELECT id FROM {table}"))
+            .await
+            .expect("the table should be readable")
+            .len()
     }
 
     fn slash_path(path: impl AsRef<std::path::Path>) -> String {

@@ -3,7 +3,8 @@
 use crate::config::TideConfig;
 use crate::utils::{
     FieldDefinition, crate_module_path, ensure_directory, ensure_writable, escape_ident,
-    print_warning, to_snake_case,
+    has_module_declaration, print_warning, read_source_or_empty, to_snake_case,
+    validate_rust_type_name,
 };
 
 /// The first line of the registry `tideorm db seed` runs: every seeder the
@@ -79,16 +80,25 @@ impl<'a> SeederGenerator<'a> {
         count: u32,
         fields: &[FieldDefinition],
     ) -> Result<String, String> {
-        ensure_directory(self.seeders_dir())?;
+        if name.trim().is_empty() {
+            return Err("Seeder name is required".to_string());
+        }
+        validate_unique_seed_fields(count, fields)?;
 
         let seeder_name = if name.ends_with("Seeder") {
             to_pascal_case(name)
         } else {
             format!("{}Seeder", to_pascal_case(name))
         };
+        validate_rust_type_name("seeder", &seeder_name)?;
+        if let Some(model_name) = &model {
+            validate_rust_type_name("model", &to_pascal_case(model_name))?;
+        }
 
         let file_name = format!("{}.rs", to_snake_case(&seeder_name));
         let file_path = format!("{}/{}", self.seeders_dir(), file_name);
+
+        ensure_directory(self.seeders_dir())?;
 
         let content = if let Some(model_name) = model {
             self.generate_model_seeder(&seeder_name, &model_name, count, fields)
@@ -184,7 +194,7 @@ impl Seed for {seeder_name} {{
     async fn run(&self, _db: &Database) -> tideorm::Result<()> {{
         println!("Seeding {model_snake}s...");
 
-        for {index} in 1..={count} {{
+        for {index} in 1u32..={count}u32 {{
             let record = {model_pascal} {{
                 {field_lines}
                 ..Default::default()
@@ -311,10 +321,65 @@ fn seed_value(field: &FieldDefinition) -> Option<(String, bool)> {
             true,
         ),
         "json" | "jsonb" => ("json!({ \"n\": i })".to_string(), true),
-        "bytes" | "blob" | "binary" => ("vec![i as u8]".to_string(), true),
+        "bytes" | "blob" | "binary" => ("(i as u32).to_be_bytes().to_vec()".to_string(), true),
         _ => return None,
     };
     Some((value, uses_index))
+}
+
+fn validate_unique_seed_fields(count: u32, fields: &[FieldDefinition]) -> Result<(), String> {
+    if count <= 1 {
+        return Ok(());
+    }
+
+    for field in fields {
+        if !field.unique || field.nullable || field.auto_increment {
+            continue;
+        }
+
+        match field.field_type.to_lowercase().as_str() {
+            "bool" | "boolean" if count > 2 => {
+                return Err(format!(
+                    "Cannot generate {count} unique values for boolean field '{}'; use a non-boolean type or reduce the seeder count to 2",
+                    field.name
+                ));
+            }
+            "bool" | "boolean" => {}
+            "i8" | "tinyint" if count > 256 => {
+                return Err(format!(
+                    "Cannot generate {count} unique values for field '{}' of type '{}'; the type has only 256 distinct values",
+                    field.name, field.field_type
+                ));
+            }
+            "i16" | "smallint" if count > 65_536 => {
+                return Err(format!(
+                    "Cannot generate {count} unique values for field '{}' of type '{}'; the type has only 65536 distinct values",
+                    field.name, field.field_type
+                ));
+            }
+            "f32" | "float" if count > 16_777_216 => {
+                return Err(format!(
+                    "Cannot generate {count} unique values for field '{}' of type '{}'; consecutive integers are exact only through 16777216",
+                    field.name, field.field_type
+                ));
+            }
+            "time" if count > 86_400 => {
+                return Err(format!(
+                    "Cannot generate {count} unique values for time field '{}'; the generated values have only 86400 distinct seconds in a day",
+                    field.name
+                ));
+            }
+            _ if seed_value(field).is_none() => {
+                return Err(format!(
+                    "Cannot generate distinct values for unique field '{}' of type '{}'; provide a supported field type or reduce the seeder count to 1",
+                    field.name, field.field_type
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Declare `module` in `<dir>/mod.rs` and add `module::name` to its `all()`
@@ -325,11 +390,11 @@ fn seed_value(field: &FieldDefinition) -> Option<(String, bool)> {
 /// break it.
 pub(crate) fn register_seeder(dir: &str, module: &str, name: &str) -> Result<bool, String> {
     let mod_path = format!("{}/mod.rs", dir);
-    let source = std::fs::read_to_string(&mod_path).unwrap_or_default();
+    let source = read_source_or_empty(&mod_path)?;
     let mut lines: Vec<String> = source.lines().map(str::to_string).collect();
 
     let declaration = format!("pub mod {};", module);
-    if !lines.iter().any(|line| line.trim() == declaration) {
+    if !has_module_declaration(&source, module) {
         match lines
             .iter()
             .rposition(|line| line.trim_start().starts_with("pub mod "))
@@ -390,7 +455,7 @@ fn to_pascal_case(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SEEDERS_MOD_RS, SeederGenerator, register_seeder};
+    use super::{SEEDERS_MOD_RS, SeederGenerator, register_seeder, validate_unique_seed_fields};
     use crate::config::TideConfig;
 
     #[test]
@@ -435,6 +500,7 @@ mod tests {
             "price:decimal",
             "uid:uuid",
             "meta:json",
+            "payload:bytes:unique",
             "note:string:nullable",
         ]
         .iter()
@@ -447,7 +513,7 @@ mod tests {
             &fields,
         );
 
-        assert!(content.contains("for i in 1..=10 {"), "{content}");
+        assert!(content.contains("for i in 1u32..=10u32 {"), "{content}");
         assert!(
             content.contains("sku: format!(\"sku-{}\", i),"),
             "{content}"
@@ -456,9 +522,42 @@ mod tests {
         assert!(content.contains("uid: Uuid::new_v4(),"), "{content}");
         assert!(content.contains("meta: json!({ \"n\": i }),"), "{content}");
         assert!(
+            content.contains("payload: (i as u32).to_be_bytes().to_vec(),"),
+            "{content}"
+        );
+        assert!(
             !content.contains("note:"),
             "an optional field is left to Default: {content}"
         );
+    }
+
+    #[test]
+    fn unique_boolean_seeders_reject_more_rows_than_distinct_values() {
+        let config = TideConfig::default();
+        let fields = vec![crate::utils::FieldDefinition::parse("active:bool:unique").unwrap()];
+
+        let error = SeederGenerator::new(&config)
+            .generate_with_fields("UserSeeder", Some("User".to_string()), 3, &fields)
+            .unwrap_err();
+
+        assert!(error.contains("unique values for boolean field 'active'"));
+    }
+
+    #[test]
+    fn unique_small_integer_seeders_reject_cast_wraparound() {
+        let int8 = vec![crate::utils::FieldDefinition::parse("code:i8:unique").unwrap()];
+        let int16 = vec![crate::utils::FieldDefinition::parse("code:i16:unique").unwrap()];
+        let float = vec![crate::utils::FieldDefinition::parse("code:f32:unique").unwrap()];
+        let time = vec![crate::utils::FieldDefinition::parse("at:time:unique").unwrap()];
+
+        assert!(validate_unique_seed_fields(256, &int8).is_ok());
+        assert!(validate_unique_seed_fields(257, &int8).is_err());
+        assert!(validate_unique_seed_fields(65_536, &int16).is_ok());
+        assert!(validate_unique_seed_fields(65_537, &int16).is_err());
+        assert!(validate_unique_seed_fields(16_777_216, &float).is_ok());
+        assert!(validate_unique_seed_fields(16_777_217, &float).is_err());
+        assert!(validate_unique_seed_fields(86_400, &time).is_ok());
+        assert!(validate_unique_seed_fields(86_401, &time).is_err());
     }
 
     #[test]

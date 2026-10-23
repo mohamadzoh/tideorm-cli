@@ -1,5 +1,118 @@
 # Changelog
 
+## 0.11.0
+
+- New projects pin TideORM `0.16.0` through `SCAFFOLD_TIDEORM_VERSION`. It is breaking for library
+  users (see its changelog). Publish this version only after `tideorm` 0.16.0 is on crates.io, or
+  `tideorm init` scaffolds a dependency that does not resolve.
+- The CLI itself builds on TideORM `0.16.0`, and so does not build from crates.io until that
+  release is out. It uses the ORM's foreign-key pragma check, URL masking and index DDL instead of
+  its own copies.
+- **SQLite URLs are read the way sqlx reads them, and `db drop` deletes the database in use.**
+  The CLI stripped the scheme as text, so `sqlite:///var/app.db` became the relative
+  `var/app.db`, `?mode=rwc` stayed in the file name, and `sqlite:app.db` was not recognised at
+  all. `db drop` then reported success after deleting `sqlite_path` (or nothing) while the real
+  database survived. URLs now take `sqlite://` or `sqlite:` in any case, drop the query string, are
+  percent-decoded and keep an absolute path absolute (`sqlite:///C:/...` on Windows too);
+  `sqlite::memory:` and `mode=memory` have no file. When a URL is set, `db create`, `db drop`,
+  `db status`, `db wipe` and `config` all use its file, never `sqlite_path`. A path written into a
+  URL has `%`, `?` and spaces escaped, so it opens the same file.
+- **A `mariadb://` URL broke every database command and made generators write SQLite DDL.** One
+  driver normaliser now serves the URL, `tideorm.toml`, `init --database` and the generators, in
+  any case: `mariadb` is `mysql` and `postgresql` is `postgres`.
+- **`migrate redo` and `migrate refresh --step` re-apply exactly the migrations they rolled
+  back.** They ran the first pending migrations instead, which are other ones while an older
+  migration is still pending. A migration with no SQL in `up()` is refused before anything is
+  rolled back.
+- **`db wipe` and `migrate fresh` drop views.** SQLite listed only tables and MySQL ran
+  `DROP TABLE` on its views, so a view survived and `migrate fresh` failed on it after every table
+  was gone. Views are dropped with `DROP VIEW` (PostgreSQL included, for one that reads no table),
+  and `db tables` on MySQL lists base tables only. They also drop the sequences no table owns
+  (PostgreSQL, MariaDB) and MariaDB's system-versioned tables, which survived the same way. On
+  PostgreSQL they leave what an extension installed (`pg_stat_statements`, PostGIS's
+  `spatial_ref_sys`), which PostgreSQL refuses to drop on its own.
+- **An inline comment in `.env` disabled the production guards.** `TIDEORM_ENV=production  # live`
+  was read with its comment, so `migrate reset` ran without `--force`. Unquoted values now end at
+  a ` #` comment, as dotenvy reads them; `Production` counts in any case; and `${VAR}` in a value
+  expands from the lines above it.
+- `db create` and `db drop` build the server URL with percent-encoded credentials (a password
+  holding `?` or `@` corrupted it, and showed in error messages), and IPv6 hosts are bracketed
+  there, in `config` and in the URL `init` writes. `config` and connection errors mask a password
+  holding `?`, `#` or `/` whole; TideORM 0.15.0's masking cut the URL at the `?` and printed the
+  rest of it.
+- **A unique field added to a SQLite table migrates.** SQLite refuses `ADD COLUMN .. UNIQUE`, so
+  the alter migration adds the column and a unique index, `idx_<table>_<column>_unique` as TideORM
+  names it, and its `down()` drops the index before the column.
+- **Generated models build without warnings.** A model with no unique field imported the prelude
+  and used none of it, which failed a `-D warnings` build; the import is kept for the code added
+  later, without the warning. Models are also laid out as rustfmt writes them, with no empty
+  `impl` block.
+- **`make migration` and `make model --migration` follow `[model] primary_key_type`.** A `uuid`
+  model got a `BIGSERIAL` key; the key now has the configured type, auto-incremented only for
+  `i32` (`INTEGER`) and `i64` (`BIGINT`). The model generator drops `auto_increment` from a
+  non-integer key, which TideORM refuses to compile.
+- **`indexed` fields get their index.** The 0.10.0 notes said `--indexed` reached the migration,
+  but only the model's `#[index]` did. `:indexed` fields, the `--indexed` list and `belongs_to`
+  foreign keys now get a `CREATE INDEX` named as the model's (`idx_<table>_<column>`); an alter
+  migration's `down()` drops the index before the column, which SQLite requires. The statements
+  are `schema.raw(..)` calls, the form `tideorm migrate` runs.
+- The factory of a keyword-named model (`Match`, `Box`, ...) compiles: its record is bound to
+  `record`, as the seeder's already was.
+- `tideorm init` escapes its answers in `tideorm.toml`, where an interactive Windows path left the
+  file unparsable, and names a project like `2048-game` `app_2048_game`, since Cargo refuses a
+  package name that starts with a digit (or is a keyword).
+- **New projects load their `.env`.** The scaffolded `src/config.rs` read only the process
+  environment, so `cargo run` panicked without `DATABASE_URL` (or, on SQLite, opened
+  `database.db` whatever `.env` said). It now loads the configured env file with `dotenvy`, which
+  scaffolds depend on; a variable already set still wins.
+- An unresolved `${DATABASE_URL}` (a fresh clone without its `.env`) no longer replaces the
+  declarative `[database]` settings with its literal text.
+- **A schema-qualified table (`--create app.users`, `make model --table app.users`) is one
+  table everywhere.** The `CREATE TABLE` and `ALTER TABLE` statements named a table called
+  `app.users` while `down()` and the indexes named `users` in schema `app`, which `down()` could
+  drop instead. Every statement now names `"app"."users"`, indexes are named after `users` and
+  dropped with their schema, and the model gets `table = "users", schema = "app"`.
+- **A database URL with part of it unresolved is an error.** `url = "postgres://app:${DB_PASSWORD}@db/app"`
+  with `DB_PASSWORD` unset was dropped, and the CLI connected with the `[database]` settings or
+  the defaults instead: `migrate --force` or `db wipe --force` ran against another database. Only
+  a URL that is one placeholder and nothing else still falls back to the `[database]` settings.
+- **`migrate reset`, `rollback --step`, `redo` and `refresh` check every migration first.** One
+  with nothing in `down()`, or whose file is gone, was reached only after the newer ones were
+  rolled back, which were then left so; `refresh` also checks every `up()` before it resets.
+- On MySQL and MariaDB an `indexed` `text` field is a `VARCHAR(255)`, as a `unique` one is: MySQL
+  cannot index a `TEXT` column, so its migration always failed.
+- A numbered `i16` key gets a `SMALLSERIAL` (PostgreSQL) or `SMALLINT AUTO_INCREMENT` (MySQL)
+  column, where it got a `BIGINT` the model could not read; `auto_increment` on a key that is not
+  an integer is refused instead of becoming a `BIGSERIAL`.
+- **With `[migration] timestamps = false`, migrations run in the order they were made.** The
+  version was the migration's name, so `add_age_to_users` ran before `create_users_table`. New
+  migrations are numbered instead: one past the highest numbered migration, `0001_..` onwards.
+- **A SQLite migration turning foreign keys off rebuilds a table safely.** Inside the migration's
+  transaction `PRAGMA foreign_keys = OFF` did nothing, so a rebuild's `DROP TABLE` deleted the rows
+  pointing at the table. Such a migration now runs on a connection that turns foreign keys off
+  before its transaction begins, and is rolled back if a foreign key then points at no row. Every
+  form SQLite reads is recognised, inside a multi-statement script too: `PRAGMA main.foreign_keys`,
+  `foreign_keys(0)`, quoted names, comments, and any value SQLite takes for false. A migration
+  returning `true` from `foreign_keys_off()`, as TideORM's `Migrator` reads it, runs the same way
+  without the pragma; one whose `foreign_keys_off()` returns anything but a literal `true` or
+  `false` is refused. A database that already has a foreign key pointing at no row is refused
+  before such a migration runs, instead of the migration being blamed for it.
+- CI runs the `db wipe` tests against PostgreSQL and MariaDB servers
+  (`TIDEORM_CLI_POSTGRES_URL`, `TIDEORM_CLI_MARIADB_URL`); without them those tests are skipped.
+- **`migrate` refuses a migration it cannot run whole, instead of running part of it.** It reads
+  `up()` and `down()` from the source and cut each at the first line starting with `}`: the end
+  of a loop, a closure or a line inside multi-line SQL, so the statements after it never ran, and
+  builder calls (`schema.create_table(..)`) were skipped, yet the migration was recorded as
+  applied. The body is now parsed as Rust (with `syn`), and one holding anything but
+  `schema.raw(..)` statements fails with the code it cannot run. `schema.raw("..")` with a plain
+  string literal runs too. A migration file that is not valid Rust is refused with the parser's
+  error instead of being scanned for statements.
+- `tideorm init` reads an existing `DATABASE_URL` as dotenvy does, quotes and inline comments
+  included, so an unchanged quoted URL is no longer taken for a different one.
+- A SQLite URL holding `mode=ro` anywhere no longer makes the CLI create the database file: sqlx
+  opens such a URL read-only whatever `mode` follows, so the empty file was all it got.
+- A related model named `_` is refused, as `Self` already was.
+
 ## 0.10.1
 
 - Track TideORM `0.15.0`. It is breaking for library users (see its changelog); new projects pin

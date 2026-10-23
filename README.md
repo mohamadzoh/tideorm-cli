@@ -57,7 +57,7 @@ config_file = "src/config.rs"
 
 [migration]
 table = "_migrations"
-timestamps = true
+timestamps = true  # false numbers new migrations 0001, 0002, .. instead
 
 [model]
 timestamps = true
@@ -230,10 +230,10 @@ tideorm make seeder UserSeeder --model=User --output=db/seeders
 tideorm make factory UserFactory --model=User --output=db/factories
 ```
 
-`--output` defaults to the same value as the matching `[paths]` entry
-(`src/migrations`, `src/seeders`, `src/factories`, `src/models`). Left alone, the
-configured `[paths]` directory wins; passing anything else overrides it for that run
-only. The generated file and the `mod.rs` next to it both go to the chosen directory,
+When `--output` is omitted, each generator uses its matching `[paths]` directory
+(`migrations`, `seeders`, `factories`, or `models`). Any explicit `--output` value
+overrides that configured path for this run, even if it matches TideORM's built-in
+default. The generated file and the `mod.rs` next to it both go to the chosen directory,
 so remember to declare that directory as a module in your crate.
 
 Moving a seeder or a factory does not move the model it imports: the generated
@@ -266,7 +266,7 @@ tideorm db drop
 tideorm db drop --name=other_db
 tideorm db drop --force  # Skip confirmation
 
-# Wipe all tables - this DROPS every table, schema included; it is not a TRUNCATE.
+# Wipe all tables - this DROPS every table and view, schema included; it is not a TRUNCATE.
 # `migrate fresh` relies on those drop semantics to rebuild from the migrations.
 tideorm db wipe
 tideorm db wipe --force        # Skip confirmation (required in production)
@@ -275,6 +275,8 @@ tideorm db wipe --drop-types   # Also drop user-defined enum types (PostgreSQL o
 # Show table information
 tideorm db table users
 tideorm db tables
+# PostgreSQL lists non-public tables as schema-qualified names
+tideorm db table app.users
 ```
 
 Destructive commands (`db drop`, `db wipe`, `db fresh`, `migrate fresh`) prompt for

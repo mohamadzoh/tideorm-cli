@@ -9,18 +9,6 @@ use crate::generators::{
 use crate::utils::{RelationDefinition, RelationType};
 use crate::utils::{print_info, print_success};
 
-/// Clap's default for `make model --output`; anything else is an explicit override.
-const DEFAULT_MODEL_OUTPUT: &str = "src/models";
-
-/// Clap's default for `make migration --output`.
-const DEFAULT_MIGRATION_OUTPUT: &str = "src/migrations";
-
-/// Clap's default for `make seeder --output`.
-const DEFAULT_SEEDER_OUTPUT: &str = "src/seeders";
-
-/// Clap's default for `make factory --output`.
-const DEFAULT_FACTORY_OUTPUT: &str = "src/factories";
-
 /// Handle make subcommands
 pub async fn handle(config_path: &str, cmd: MakeCommands, verbose: bool) -> Result<(), String> {
     match cmd {
@@ -59,7 +47,7 @@ pub async fn handle(config_path: &str, cmd: MakeCommands, verbose: bool) -> Resu
                 soft_deletes,
                 timestamps,
                 tokenize,
-                &output,
+                output.as_deref(),
                 migration || all,
                 seeder || all,
                 factory || all,
@@ -74,20 +62,31 @@ pub async fn handle(config_path: &str, cmd: MakeCommands, verbose: bool) -> Resu
             table,
             fields,
             output,
-        } => make_migration(config_path, &name, create, table, fields, &output, verbose).await,
+        } => {
+            make_migration(
+                config_path,
+                &name,
+                create,
+                table,
+                fields,
+                output.as_deref(),
+                verbose,
+            )
+            .await
+        }
 
         MakeCommands::Seeder {
             name,
             model,
             count,
             output,
-        } => make_seeder(config_path, &name, model, count, &output, verbose).await,
+        } => make_seeder(config_path, &name, model, count, output.as_deref(), verbose).await,
 
         MakeCommands::Factory {
             name,
             model,
             output,
-        } => make_factory(config_path, &name, model, &output, verbose).await,
+        } => make_factory(config_path, &name, model, output.as_deref(), verbose).await,
     }
 }
 
@@ -108,13 +107,17 @@ async fn make_model(
     soft_deletes: Option<bool>,
     timestamps: Option<bool>,
     tokenize: Option<bool>,
-    output: &str,
+    output: Option<&str>,
     create_migration: bool,
     create_seeder: bool,
     create_factory: bool,
     verbose: bool,
 ) -> Result<(), String> {
     let mut config = TideConfig::load_or_default(config_path)?;
+
+    if create_migration {
+        crate::generators::migration::ensure_ddl_driver(&config.database.driver)?;
+    }
 
     if verbose {
         print_info(&format!("Generating model: {}", name));
@@ -149,7 +152,7 @@ async fn make_model(
     let soft_deletes = soft_deletes.unwrap_or(config.model.soft_deletes);
     let timestamps = timestamps.unwrap_or(config.model.timestamps);
     let tokenize = tokenize.unwrap_or(config.model.tokenize);
-    let output_dir = match output_override(output, DEFAULT_MODEL_OUTPUT) {
+    let output_dir = match output_override(output)? {
         Some(dir) => dir.to_string(),
         None => config.paths.models.clone(),
     };
@@ -238,7 +241,7 @@ async fn make_migration(
     create: Option<String>,
     table: Option<String>,
     fields: Option<String>,
-    output: &str,
+    output: Option<&str>,
     verbose: bool,
 ) -> Result<(), String> {
     let config = TideConfig::load_or_default(config_path)?;
@@ -247,7 +250,7 @@ async fn make_migration(
         print_info(&format!("Generating migration: {}", name));
     }
 
-    let output_dir = output_override(output, DEFAULT_MIGRATION_OUTPUT);
+    let output_dir = output_override(output)?;
     let generator = MigrationGenerator::new(&config).output_dir(output_dir);
     let path = generator.generate(name, create, table, fields, false, false)?;
 
@@ -262,7 +265,7 @@ async fn make_seeder(
     name: &str,
     model: Option<String>,
     count: u32,
-    output: &str,
+    output: Option<&str>,
     verbose: bool,
 ) -> Result<(), String> {
     let config = TideConfig::load_or_default(config_path)?;
@@ -271,7 +274,7 @@ async fn make_seeder(
         print_info(&format!("Generating seeder: {}", name));
     }
 
-    let output_dir = output_override(output, DEFAULT_SEEDER_OUTPUT);
+    let output_dir = output_override(output)?;
     let generator = SeederGenerator::new(&config).output_dir(output_dir);
     let path = generator.generate(name, model, count)?;
 
@@ -285,7 +288,7 @@ async fn make_factory(
     config_path: &str,
     name: &str,
     model: Option<String>,
-    output: &str,
+    output: Option<&str>,
     verbose: bool,
 ) -> Result<(), String> {
     let config = TideConfig::load_or_default(config_path)?;
@@ -294,7 +297,7 @@ async fn make_factory(
         print_info(&format!("Generating factory: {}", name));
     }
 
-    let output_dir = output_override(output, DEFAULT_FACTORY_OUTPUT);
+    let output_dir = output_override(output)?;
     let generator = FactoryGenerator::new(&config).output_dir(output_dir);
     let path = generator.generate(name, model)?;
 
@@ -303,18 +306,12 @@ async fn make_factory(
     Ok(())
 }
 
-/// The directory an explicit `--output` asks for, or `None` when the flag was left at its
-/// clap default and the configured `[paths]` entry should keep winning.
-///
-/// `--output` carries a default value rather than being optional, so "not supplied" and
-/// "supplied with the same value" are indistinguishable; treating both as "use the config"
-/// is what keeps a project whose `[paths]` point elsewhere working without the flag.
-fn output_override<'a>(output: &'a str, clap_default: &str) -> Option<&'a str> {
-    let output = output.trim();
-    if output.is_empty() || output == clap_default {
-        None
-    } else {
-        Some(output)
+/// The directory an explicit `--output` asks for, or `None` when the configured path wins.
+fn output_override(output: Option<&str>) -> Result<Option<&str>, String> {
+    match output {
+        Some("") => Err("--output requires a non-empty directory".to_string()),
+        Some(directory) => Ok(Some(directory)),
+        None => Ok(None),
     }
 }
 
@@ -437,9 +434,8 @@ fn prepare_model_migration_fields(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_FACTORY_OUTPUT, DEFAULT_MIGRATION_OUTPUT, DEFAULT_MODEL_OUTPUT,
-        DEFAULT_SEEDER_OUTPUT, make_factory, make_migration, make_model, make_seeder,
-        output_override, prepare_model_migration_fields, resolve_table_name,
+        make_factory, make_migration, make_model, make_seeder, output_override,
+        prepare_model_migration_fields, resolve_table_name,
     };
     use std::fs;
     use std::path::Path;
@@ -501,23 +497,16 @@ mod tests {
     }
 
     #[test]
-    fn output_override_only_reports_an_explicit_directory() {
+    fn output_override_preserves_every_explicit_directory() {
+        assert_eq!(output_override(None), Ok(None));
+        assert_eq!(output_override(Some("src/models")), Ok(Some("src/models")));
         assert_eq!(
-            output_override(DEFAULT_SEEDER_OUTPUT, DEFAULT_SEEDER_OUTPUT),
-            None
-        );
-        assert_eq!(output_override("   ", DEFAULT_SEEDER_OUTPUT), None);
-        assert_eq!(
-            output_override("  db/seeders  ", DEFAULT_SEEDER_OUTPUT),
-            Some("db/seeders")
+            output_override(Some(" db/seeders ")),
+            Ok(Some(" db/seeders "))
         );
         assert_eq!(
-            output_override(DEFAULT_FACTORY_OUTPUT, DEFAULT_FACTORY_OUTPUT),
-            None
-        );
-        assert_eq!(
-            output_override(DEFAULT_MODEL_OUTPUT, DEFAULT_MIGRATION_OUTPUT),
-            Some(DEFAULT_MODEL_OUTPUT)
+            output_override(Some("")),
+            Err("--output requires a non-empty directory".to_string())
         );
     }
 
@@ -531,7 +520,7 @@ mod tests {
             Some("users".to_string()),
             None,
             None,
-            output.path(),
+            Some(output.path()),
             false,
         )
         .await
@@ -550,7 +539,7 @@ mod tests {
             "UserSeeder",
             Some("User".to_string()),
             5,
-            output.path(),
+            Some(output.path()),
             false,
         )
         .await
@@ -575,7 +564,7 @@ mod tests {
             MISSING_CONFIG,
             "UserFactory",
             Some("User".to_string()),
-            output.path(),
+            Some(output.path()),
             false,
         )
         .await
@@ -610,7 +599,7 @@ mod tests {
             Some(false),
             Some(false),
             Some(false),
-            &model_output,
+            Some(model_output.as_str()),
             false,
             true,
             false,

@@ -1,12 +1,16 @@
 //! Migration generator for TideORM CLI
 
-use crate::config::TideConfig;
+use crate::config::{TideConfig, canonical_driver};
 use crate::utils::{
-    FieldDefinition, database_type, ensure_directory, ensure_writable, escape_ident,
-    migration_timestamp, quote_sql_identifier, render_template, to_snake_case,
+    FieldDefinition, append_source_block, auto_increments, database_type, ensure_directory,
+    ensure_writable, escape_ident, has_module_declaration, migration_timestamp,
+    quote_sql_identifier, read_source_or_empty, render_template, split_table, to_snake_case,
+    validate_rust_type_name, validate_sql_identifier, validate_sql_object_name,
 };
 use serde::Serialize;
-use tideorm::migration::{AlterTableBuilder, DefaultValue, TableBuilder};
+use tideorm::config::DatabaseType;
+use tideorm::migration::{AlterTableBuilder, ColumnType, DefaultValue, TableBuilder};
+use tideorm::model::IndexDefinition;
 
 /// `sql` with every line indented by `prefix`, to sit inside a generated file.
 fn indent(sql: &str, prefix: &str) -> String {
@@ -17,6 +21,21 @@ fn indent(sql: &str, prefix: &str) -> String {
             "
 ",
         )
+}
+
+/// The `schema.raw(..)` line that runs one statement.
+///
+/// Every statement is its own raw string literal, which is what the CLI's migration
+/// runner reads back. The trailing space keeps a quoted name from sitting directly
+/// against the `"#` that closes the literal.
+fn raw_call(sql: &str) -> String {
+    format!("        schema.raw(r#\"{} \"#).await?;", sql)
+}
+
+/// The `schema.raw(..)` call running one statement already indented over
+/// several lines, as the template's `raw_sql` mode writes it.
+fn raw_block(indented_sql: &str) -> String {
+    format!("        schema.raw(r#\"\n{indented_sql}\n        \"#).await?;")
 }
 
 /// Migration generator
@@ -62,35 +81,41 @@ impl<'a> MigrationGenerator<'a> {
         include_timestamps: bool,
         include_soft_deletes: bool,
     ) -> Result<String, String> {
+        if create_table.is_some() && alter_table.is_some() {
+            return Err("A migration cannot create and alter a table at the same time".to_string());
+        }
+        if fields.is_some() && create_table.is_none() && alter_table.is_none() {
+            return Err("Migration fields require --create or --table".to_string());
+        }
+
+        let migration_name = to_snake_case(name);
+        let struct_name = to_pascal_case(&migration_name);
+        validate_rust_type_name("migration", &struct_name)?;
+
+        if create_table.is_some() || alter_table.is_some() {
+            ensure_ddl_driver(&self.config.database.driver)?;
+        }
+
         let directory = self.migrations_dir();
         ensure_directory(directory)?;
 
-        let migration_name = to_snake_case(name);
-        let timestamp = if self.config.migration.timestamps {
+        // Migrations run in version order. Without a timestamp the version is
+        // the next number in the directory, so they still run in the order
+        // they were made rather than by name.
+        let version = if self.config.migration.timestamps {
             migration_timestamp()
         } else {
-            String::new()
+            next_migration_number(directory)
         };
-
-        let file_name = if timestamp.is_empty() {
-            format!("{}.rs", migration_name)
-        } else {
-            format!("{}_{}.rs", timestamp, migration_name)
-        };
+        let file_name = format!("{}_{}.rs", version, migration_name);
 
         let file_path = format!("{}/{}", directory, file_name);
 
         ensure_writable(&file_path)?;
-        Self::ensure_no_conflicting_migration(directory, &timestamp, &migration_name)?;
+        Self::ensure_no_conflicting_migration(directory, &version, &migration_name)?;
 
         // Parse fields
         let parsed_fields = Self::parse_fields(fields.as_deref(), &self.config.database.driver)?;
-
-        let version = if timestamp.is_empty() {
-            migration_name.clone()
-        } else {
-            timestamp.clone()
-        };
 
         // Generate content
         let content = if let Some(table) = create_table {
@@ -164,9 +189,9 @@ impl<'a> MigrationGenerator<'a> {
                 ));
             }
 
-            if !timestamp.is_empty() && stem.starts_with(&format!("{}_", timestamp)) {
+            if stem.starts_with(&format!("{}_", timestamp)) {
                 return Err(format!(
-                    "Migration version '{}' is already used by '{}.rs'. Re-run to get a fresh timestamp.",
+                    "Migration version '{}' is already used by '{}.rs'. Re-run to get a fresh one.",
                     timestamp, stem
                 ));
             }
@@ -178,6 +203,60 @@ impl<'a> MigrationGenerator<'a> {
     /// Quote a table or column name for the configured driver.
     fn quote(&self, kind: &str, name: &str) -> Result<String, String> {
         quote_sql_identifier(&self.config.database.driver, kind, name)
+    }
+
+    /// The `CREATE INDEX` of an `indexed` field, rendered by TideORM's `TableBuilder`.
+    ///
+    /// It is named as TideORM names a model's `#[index(..)]`, so schema sync finds the
+    /// index the migration created. `if_not_exists` goes with a `CREATE TABLE IF NOT
+    /// EXISTS`; MySQL has no `CREATE INDEX IF NOT EXISTS`.
+    fn create_index_sql(
+        &self,
+        table: &str,
+        column: &str,
+        unique: bool,
+        if_not_exists: bool,
+    ) -> Result<String, String> {
+        validate_sql_identifier("column", column)?;
+        let (_, bare) = split_table(table);
+        let mut builder = TableBuilder::new(bare, database_type(&self.config.database.driver));
+        if unique {
+            builder.unique_index(&[column]);
+        } else {
+            builder.index(&[column]);
+        }
+        self.qualify_table(&builder.__index_sql(if_not_exists).concat(), table)
+    }
+
+    /// The `DROP INDEX` undoing [`Self::create_index_sql`], as `Schema::drop_index`
+    /// renders it. An index lives in its table's schema, so it is named with it.
+    fn drop_index_sql(&self, table: &str, column: &str, unique: bool) -> Result<String, String> {
+        validate_sql_object_name("table", table)?;
+        let (schema, bare) = split_table(table);
+        // `IF EXISTS` for a unique one, as TideORM drops the index of a unique
+        // column with it.
+        Ok(tideorm::migration::__drop_index_sql(
+            database_type(&self.config.database.driver),
+            schema,
+            bare,
+            &index_name(bare, column, unique),
+            unique,
+        ))
+    }
+
+    /// `statement`, rendered by TideORM's migration builders for the bare
+    /// name of `table`, naming `table` schema-qualified. The builders quote a
+    /// name whole, so they would create a table called `app.users`; the
+    /// table is the first name a statement quotes.
+    fn qualify_table(&self, statement: &str, table: &str) -> Result<String, String> {
+        let (Some(_), bare) = split_table(table) else {
+            return Ok(statement.to_string());
+        };
+        Ok(statement.replacen(&self.quote("table", bare)?, &self.quote("table", table)?, 1))
+    }
+
+    fn is_mysql(&self) -> bool {
+        database_type(&self.config.database.driver) == DatabaseType::MySQL
     }
 
     /// Generate a create table migration
@@ -196,12 +275,19 @@ impl<'a> MigrationGenerator<'a> {
 
         // The table is rendered by TideORM's own migration builder, so a generated
         // migration creates the table `Schema::create_table` would, on every driver.
-        let mut builder = TableBuilder::new(table, database_type(driver));
+        let mut builder = TableBuilder::new(split_table(table).1, database_type(driver));
         if !fields
             .iter()
             .any(|field| field.primary_key || field.name == self.config.model.primary_key)
         {
-            builder.big_increments(&self.config.model.primary_key);
+            // The key the model generator declares: of the configured type, and numbered
+            // by the database only when that type is an integer.
+            let mut key = FieldDefinition::parse(&format!(
+                "{}:{}:primary_key",
+                self.config.model.primary_key, self.config.model.primary_key_type
+            ))?;
+            key.auto_increment = auto_increments(&key.field_type);
+            self.add_column(&mut builder, &key, driver)?;
         }
         for field in fields {
             self.add_column(&mut builder, field, driver)?;
@@ -212,18 +298,37 @@ impl<'a> MigrationGenerator<'a> {
         if include_soft_deletes {
             builder.soft_deletes();
         }
-        let raw_sql = indent(&builder.__create_sql(), "        ");
+        let raw_sql = indent(
+            &self.qualify_table(&builder.__create_sql(), table)?,
+            "        ",
+        );
+        let indexes = fields
+            .iter()
+            .filter(|field| field.indexed)
+            .map(|field| self.create_index_sql(table, &field.name, false, true))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // A table with indexes needs a statement each, so the table is one statement
+        // among them; a template that renders either mode keeps working.
+        let (up_mode, up_raw_sql, up_statements) = if indexes.is_empty() {
+            ("raw_sql", Some(raw_sql), Vec::new())
+        } else {
+            let statements = std::iter::once(raw_block(&raw_sql))
+                .chain(indexes.iter().map(|sql| raw_call(sql)))
+                .collect();
+            ("statements", None, statements)
+        };
 
         let context = MigrationTemplateContext {
             name: name.to_string(),
             version: version.to_string(),
             struct_name,
             description: format!("Creates the {} table.", table),
-            up_mode: "raw_sql".to_string(),
+            up_mode: up_mode.to_string(),
             down_mode: "raw_sql".to_string(),
-            up_raw_sql: Some(raw_sql),
+            up_raw_sql,
             down_raw_sql: Some(format!("DROP TABLE IF EXISTS {}", quoted_table)),
-            up_statements: Vec::new(),
+            up_statements,
             down_statements: Vec::new(),
         };
 
@@ -243,8 +348,13 @@ impl<'a> MigrationGenerator<'a> {
         // Validated here; the builders quote it themselves.
         self.quote("table", table)?;
 
-        let mut up = AlterTableBuilder::new(table, database_type(driver));
-        let mut down = AlterTableBuilder::new(table, database_type(driver));
+        let bare = split_table(table).1;
+        // SQLite refuses `ADD COLUMN .. UNIQUE`: the column is added plain and a unique
+        // index, named as TideORM names one, enforces it.
+        let unique_index =
+            |field: &FieldDefinition| field.unique && canonical_driver(driver) == Some("sqlite");
+        let mut up = AlterTableBuilder::new(bare, database_type(driver));
+        let mut down = AlterTableBuilder::new(bare, database_type(driver));
         for field in fields {
             let column = up.add_column(&field.name, field.migration_column_type(driver));
             let column = if field.nullable {
@@ -252,7 +362,7 @@ impl<'a> MigrationGenerator<'a> {
             } else {
                 column.not_null()
             };
-            let column = if field.unique {
+            let column = if field.unique && !unique_index(field) {
                 column.unique()
             } else {
                 column
@@ -263,17 +373,33 @@ impl<'a> MigrationGenerator<'a> {
             down.drop_column(&field.name);
         }
         let raw_statements = |alter: &AlterTableBuilder| -> Result<Vec<String>, String> {
-            // The trailing space keeps a quoted name from sitting directly against the
-            // `"#` that closes the raw string literal.
-            Ok(alter
+            alter
                 .__statements()
                 .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|statement| format!("        schema.raw(r#\"{} \"#).await?;", statement))
-                .collect())
+                .iter()
+                .map(|statement| Ok(raw_call(&self.qualify_table(statement, table)?)))
+                .collect()
         };
-        let up_statements = raw_statements(&up)?;
-        let down_statements = raw_statements(&down)?;
+        // The indexes come after the columns they cover, and are dropped before them:
+        // SQLite refuses to drop a column an index still uses.
+        let mut up_statements = raw_statements(&up)?;
+        let dropped_columns = raw_statements(&down)?;
+        let mut down_statements = Vec::new();
+        for field in fields.iter().filter(|field| unique_index(field)) {
+            let create_index = self.create_index_sql(table, &field.name, true, false)?;
+            up_statements.push(raw_call(&create_index));
+            // A TideORM that drops this index with the column already says so.
+            let drop_index = raw_call(&self.drop_index_sql(table, &field.name, true)?);
+            if !dropped_columns.contains(&drop_index) {
+                down_statements.push(drop_index);
+            }
+        }
+        for field in fields.iter().filter(|field| field.indexed) {
+            let create_index = self.create_index_sql(table, &field.name, false, false)?;
+            up_statements.push(raw_call(&create_index));
+            down_statements.push(raw_call(&self.drop_index_sql(table, &field.name, false)?));
+        }
+        down_statements.extend(dropped_columns);
 
         let context = MigrationTemplateContext {
             name: name.to_string(),
@@ -372,7 +498,36 @@ impl<'a> MigrationGenerator<'a> {
             ));
         }
         if is_primary_key && field.auto_increment {
-            builder.big_increments(&field.name);
+            // A numbered key keeps the width the model reads it as: a wider one is a
+            // column the driver will not decode into the field.
+            match field.migration_column_type(driver) {
+                ColumnType::Integer => {
+                    builder.increments(&field.name);
+                }
+                ColumnType::BigInteger => {
+                    builder.big_increments(&field.name);
+                }
+                // SQLite numbers only an `INTEGER PRIMARY KEY`, which holds any width.
+                ColumnType::SmallInteger if canonical_driver(driver) == Some("sqlite") => {
+                    builder.increments(&field.name);
+                }
+                ColumnType::SmallInteger => {
+                    let serial = if self.is_mysql() {
+                        "SMALLINT AUTO_INCREMENT"
+                    } else {
+                        "SMALLSERIAL"
+                    };
+                    builder
+                        .column(&field.name, ColumnType::Custom(serial.to_string()))
+                        .primary_key();
+                }
+                _ => {
+                    return Err(format!(
+                        "Field '{}' is auto_increment, which takes an integer key (i16, i32 or i64)",
+                        field.name
+                    ));
+                }
+            }
             return Ok(());
         }
 
@@ -401,7 +556,7 @@ impl<'a> MigrationGenerator<'a> {
         let file_stem = file_name.trim_end_matches(".rs");
         let module_name = migration_module_name(file_stem);
 
-        let existing = std::fs::read_to_string(&mod_path).unwrap_or_default();
+        let existing = read_source_or_empty(&mod_path)?;
 
         let module_decl = if module_name == file_stem {
             format!("pub mod {};", module_name)
@@ -409,17 +564,38 @@ impl<'a> MigrationGenerator<'a> {
             format!("#[path = \"{}\"]\npub mod {};", file_name, module_name)
         };
 
-        if existing.contains(&format!("pub mod {};", module_name)) {
+        if has_module_declaration(&existing, &module_name) {
             return Ok(());
         }
 
-        let new_content = format!("{}{}\n", existing, module_decl);
+        let new_content = append_source_block(&existing, &module_decl);
 
         std::fs::write(&mod_path, new_content)
             .map_err(|e| format!("Failed to update mod.rs: {}", e))?;
 
         Ok(())
     }
+}
+
+/// The version of a migration made without a timestamp: one past the highest
+/// numbered migration in `directory`, four digits or more, so that versions
+/// compare as text in the order they were made.
+fn next_migration_number(directory: &str) -> String {
+    let highest = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let (number, _) = name.strip_suffix(".rs")?.split_once('_')?;
+            if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            number.parse::<u128>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("{:04}", highest + 1)
 }
 
 const DEFAULT_MIGRATION_TEMPLATE: &str = r##"//! Migration: {{ name }}
@@ -478,6 +654,25 @@ struct MigrationTemplateContext {
 /// Convert string to PascalCase
 fn to_pascal_case(s: &str) -> String {
     heck::AsPascalCase(s).to_string()
+}
+
+/// The name TideORM gives an unnamed index on `table`'s `column`: `idx_<table>_<column>`.
+///
+/// A schema-qualified table contributes its own name only, so the index name stays one
+/// identifier.
+/// Refuse a driver the generators write no migration DDL for.
+pub(crate) fn ensure_ddl_driver(driver: &str) -> Result<(), String> {
+    match canonical_driver(driver) {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "Unsupported database driver for migration DDL: {driver}"
+        )),
+    }
+}
+
+/// The name TideORM gives the index of `column` on the bare table `table`.
+fn index_name(table: &str, column: &str, unique: bool) -> String {
+    IndexDefinition::__generated(table, vec![column.to_string()], unique).name
 }
 
 fn migration_module_name(file_stem: &str) -> String {
@@ -742,6 +937,239 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_drivers_do_not_generate_sqlite_migrations() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("migrations");
+        let mut config = TideConfig::default();
+        config.database.driver = "oracle".to_string();
+        config.migration.timestamps = false;
+
+        let error = MigrationGenerator::new(&config)
+            .output_dir(Some(output.to_str().unwrap()))
+            .generate(
+                "create_users_table",
+                Some("users".to_string()),
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("Unsupported database driver"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn conflicting_migration_targets_are_rejected_before_creating_output() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("migrations");
+        let config = TideConfig::default();
+
+        let error = MigrationGenerator::new(&config)
+            .output_dir(Some(output.to_str().unwrap()))
+            .generate(
+                "change_users",
+                Some("users".to_string()),
+                Some("users".to_string()),
+                None,
+                false,
+                false,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("cannot create and alter"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn fields_without_a_migration_target_are_rejected_before_creating_output() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("migrations");
+        let config = TideConfig::default();
+
+        let error = MigrationGenerator::new(&config)
+            .output_dir(Some(output.to_str().unwrap()))
+            .generate(
+                "change_users",
+                None,
+                None,
+                Some("name:string".to_string()),
+                false,
+                false,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("fields require --create or --table"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn invalid_migration_type_names_are_rejected_before_creating_output() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("migrations");
+        let config = TideConfig::default();
+
+        for name in ["", "123", "self"] {
+            let error = MigrationGenerator::new(&config)
+                .output_dir(Some(output.to_str().unwrap()))
+                .generate(name, None, None, None, false, false)
+                .unwrap_err();
+
+            assert!(error.contains("migration"), "{error}");
+            assert!(!output.exists());
+        }
+    }
+
+    /// Without timestamps, a migration made after another runs after it,
+    /// whatever their names: `add_age_to_users` sorts before
+    /// `create_users_table` and used to run first.
+    #[test]
+    fn test_migrations_without_timestamps_keep_the_order_they_were_made_in() {
+        let dir = tempdir().unwrap();
+        let mut config = TideConfig::default();
+        config.paths.migrations = dir.path().to_string_lossy().into_owned();
+        config.migration.timestamps = false;
+        let generator = MigrationGenerator::new(&config);
+
+        let created = generator
+            .generate(
+                "create_users_table",
+                Some("users".to_string()),
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let altered = generator
+            .generate(
+                "add_age_to_users",
+                None,
+                Some("users".to_string()),
+                Some("age:i32".to_string()),
+                false,
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            created.ends_with("/0001_create_users_table.rs"),
+            "{created}"
+        );
+        assert!(altered.ends_with("/0002_add_age_to_users.rs"), "{altered}");
+        let altered = std::fs::read_to_string(altered).unwrap();
+        assert!(altered.contains("\"0002\""), "{altered}");
+    }
+
+    /// Every statement of a migration for `app.users` names the same table:
+    /// the create and alter statements quoted it whole, as a table called
+    /// `app.users`, where the drop and the indexes named `users` in `app`.
+    #[test]
+    fn test_schema_qualified_tables_are_named_alike_everywhere() {
+        let mut config = TideConfig::default();
+        config.database.driver = "postgres".to_string();
+        let generator = MigrationGenerator::new(&config);
+        let fields = [FieldDefinition::parse("email:string:indexed").unwrap()];
+
+        let created = generator
+            .generate_create_table(
+                "create_users_table",
+                "1",
+                "app.users",
+                &fields,
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(
+            created.contains("CREATE TABLE IF NOT EXISTS \"app\".\"users\" ("),
+            "{created}"
+        );
+        assert!(!created.contains("\"app.users\""), "{created}");
+        assert!(
+            created.contains(
+                "CREATE INDEX IF NOT EXISTS \"idx_users_email\" ON \"app\".\"users\" (\"email\")"
+            ),
+            "{created}"
+        );
+        assert!(
+            created.contains("DROP TABLE IF EXISTS \"app\".\"users\""),
+            "{created}"
+        );
+
+        let altered = generator
+            .generate_alter_table("add_email_to_users", "2", "app.users", &fields)
+            .unwrap();
+        assert!(
+            altered.contains("ALTER TABLE \"app\".\"users\" ADD COLUMN"),
+            "{altered}"
+        );
+        assert!(
+            altered.contains("ALTER TABLE \"app\".\"users\" DROP COLUMN"),
+            "{altered}"
+        );
+        assert!(
+            altered.contains("DROP INDEX \"app\".\"idx_users_email\""),
+            "{altered}"
+        );
+        assert!(!altered.contains("\"app.users\""), "{altered}");
+    }
+
+    /// SQLite refuses `ADD COLUMN .. UNIQUE`, so a unique field added there is a column
+    /// and a unique index named as TideORM names one, dropped before the column.
+    #[test]
+    fn test_a_unique_column_added_on_sqlite_is_a_unique_index() {
+        let mut config = TideConfig::default();
+        config.database.driver = "sqlite".to_string();
+        let fields = [FieldDefinition::parse("email:string:unique").unwrap()];
+        let content = MigrationGenerator::new(&config)
+            .generate_alter_table("add_email_to_users", "1", "users", &fields)
+            .unwrap();
+
+        assert!(!content.contains(" UNIQUE \"#"), "{content}");
+        assert!(
+            content.contains(
+                "CREATE UNIQUE INDEX \"idx_users_email_unique\" ON \"users\" (\"email\")"
+            ),
+            "{content}"
+        );
+        let drop_index = "DROP INDEX IF EXISTS \"idx_users_email_unique\"";
+        assert_eq!(content.matches(drop_index).count(), 1, "{content}");
+        let down = &content[content.find("async fn down").unwrap()..];
+        assert!(
+            down.find(drop_index).unwrap() < down.find("DROP COLUMN").unwrap(),
+            "{content}"
+        );
+    }
+
+    /// An `i16` key numbered by the database got a `BIGSERIAL`/`BIGINT` column,
+    /// which the driver refuses to read into the model's `i16`.
+    #[test]
+    fn test_a_numbered_key_keeps_its_width() {
+        let fields = [FieldDefinition::parse("id:i16:primary_key:auto_increment").unwrap()];
+        let mut config = TideConfig::default();
+        for (driver, column) in [
+            ("postgres", "\"id\" SMALLSERIAL"),
+            ("mysql", "`id` SMALLINT AUTO_INCREMENT"),
+            ("sqlite", "\"id\" INTEGER"),
+        ] {
+            config.database.driver = driver.to_string();
+            let content = MigrationGenerator::new(&config)
+                .generate_create_table("create_users_table", "1", "users", &fields, false, false)
+                .unwrap();
+            assert!(content.contains(column), "{driver}: {content}");
+            assert!(!content.contains("BIG"), "{driver}: {content}");
+        }
+
+        let uuid = [FieldDefinition::parse("id:uuid:primary_key:auto_increment").unwrap()];
+        let error = MigrationGenerator::new(&config)
+            .generate_create_table("create_users_table", "1", "users", &uuid, false, false)
+            .unwrap_err();
+        assert!(error.contains("integer key"), "{error}");
+    }
+
+    #[test]
     fn test_output_dir_overrides_the_configured_migrations_path() {
         let dir = tempdir().unwrap();
         let output = dir.path().join("custom").to_string_lossy().into_owned();
@@ -757,5 +1185,115 @@ mod tests {
 
         assert!(path.starts_with(&output), "{}", path);
         assert!(std::path::Path::new(&format!("{}/mod.rs", output)).exists());
+    }
+
+    fn create_users_table(config: &TideConfig, fields: &[&str]) -> String {
+        let fields: Vec<_> = fields
+            .iter()
+            .map(|field| FieldDefinition::parse(field).unwrap())
+            .collect();
+        MigrationGenerator::new(config)
+            .generate_create_table("create_users_table", "1", "users", &fields, false, false)
+            .unwrap()
+    }
+
+    /// A `mariadb` driver used to fall through to SQLite's DDL.
+    #[test]
+    fn test_mariadb_projects_get_mysql_ddl() {
+        let mut config = TideConfig::default();
+        config.database.driver = "mariadb".to_string();
+
+        let content = create_users_table(&config, &["name:string"]);
+        assert!(content.contains("`id` BIGINT AUTO_INCREMENT"), "{content}");
+        assert!(
+            content.contains("`name` VARCHAR(255) NOT NULL"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn test_default_primary_key_follows_the_configured_type() {
+        let mut config = TideConfig::default();
+        config.database.driver = "postgres".to_string();
+
+        config.model.primary_key_type = "uuid".to_string();
+        let content = create_users_table(&config, &[]);
+        assert!(content.contains("\"id\" UUID,"), "{content}");
+        assert!(content.contains("PRIMARY KEY (\"id\")"), "{content}");
+        assert!(!content.contains("SERIAL"), "{content}");
+
+        config.model.primary_key_type = "i32".to_string();
+        let content = create_users_table(&config, &[]);
+        assert!(content.contains("\"id\" SERIAL"), "{content}");
+        assert!(!content.contains("BIGSERIAL"), "{content}");
+
+        config.model.primary_key_type = "i64".to_string();
+        let content = create_users_table(&config, &[]);
+        assert!(content.contains("\"id\" BIGSERIAL"), "{content}");
+    }
+
+    #[test]
+    fn test_indexed_fields_get_an_index_in_create_migrations() {
+        let mut config = TideConfig::default();
+        config.database.driver = "postgres".to_string();
+
+        let content = create_users_table(&config, &["email:string:indexed", "name:string"]);
+        assert!(
+            content.contains(
+                "        schema.raw(r#\"CREATE INDEX IF NOT EXISTS \"idx_users_email\" ON \"users\" (\"email\") \"#).await?;"
+            ),
+            "{content}"
+        );
+        assert!(content.contains("CREATE TABLE IF NOT EXISTS \"users\""));
+        assert!(!content.contains("idx_users_name"), "{content}");
+        // The table takes its indexes along.
+        assert!(content.contains("schema.raw(r#\"DROP TABLE IF EXISTS \"users\" \"#)"));
+
+        config.database.driver = "mysql".to_string();
+        let content = create_users_table(&config, &["email:string:indexed"]);
+        assert!(
+            content.contains("CREATE INDEX `idx_users_email` ON `users` (`email`)"),
+            "{content}"
+        );
+
+        // MySQL refuses an index on a TEXT column (error 1170), so the column is
+        // a VARCHAR as a unique one is.
+        let content = create_users_table(&config, &["slug:text:indexed"]);
+        assert!(
+            content.contains("`slug` VARCHAR(255) NOT NULL"),
+            "{content}"
+        );
+        assert!(!content.contains("LONGTEXT"), "{content}");
+    }
+
+    #[test]
+    fn test_indexed_fields_get_an_index_in_alter_migrations() {
+        let mut config = TideConfig::default();
+        config.database.driver = "sqlite".to_string();
+
+        let fields = vec![FieldDefinition::parse("email:string:nullable:indexed").unwrap()];
+        let content = MigrationGenerator::new(&config)
+            .generate_alter_table("add_email_to_users", "1", "users", &fields)
+            .unwrap();
+
+        let position = |needle: &str| {
+            content
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}:\n{content}"))
+        };
+        let create_index = "CREATE INDEX \"idx_users_email\" ON \"users\" (\"email\")";
+        let drop_index = "DROP INDEX \"idx_users_email\"";
+        assert!(position("ADD COLUMN \"email\"") < position(create_index));
+        // SQLite cannot drop a column an index still covers.
+        assert!(position(drop_index) < position("DROP COLUMN \"email\""));
+
+        config.database.driver = "mysql".to_string();
+        let content = MigrationGenerator::new(&config)
+            .generate_alter_table("add_email_to_users", "1", "users", &fields)
+            .unwrap();
+        assert!(
+            content.contains("DROP INDEX `idx_users_email` ON `users`"),
+            "{content}"
+        );
     }
 }

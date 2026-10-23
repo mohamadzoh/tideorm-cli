@@ -73,6 +73,33 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # `db wipe` reads each server's catalog its own way, so its tests run against
+    # real servers; each creates a database of its own there and drops it after.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mariadb:
+        image: mariadb:lts
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "1"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout tideorm-cli
         uses: actions/checkout@v6
@@ -121,4 +148,7 @@ jobs:
 
       - name: Run tests
         working-directory: tideorm-cli
+        env:
+          TIDEORM_CLI_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+          TIDEORM_CLI_MARIADB_URL: mysql://root@127.0.0.1:3306/mysql
         run: cargo test

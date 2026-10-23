@@ -102,7 +102,7 @@ enum Commands {
 
     /// Show schema information
     Schema {
-        /// Table name to show schema for
+        /// Table name to show schema for (use schema.table on PostgreSQL)
         #[arg(short, long)]
         table: Option<String>,
     },
@@ -125,7 +125,7 @@ enum MigrateCommands {
         force: bool,
 
         /// Run a specific migration step
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         step: Option<u32>,
     },
 
@@ -151,7 +151,7 @@ enum MigrateCommands {
     /// Run pending migrations - all of them unless --step or --migration narrows it down
     Up {
         /// Number of pending migrations to run (default: all of them)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "migration", value_parser = clap::value_parser!(u32).range(1..))]
         step: Option<u32>,
 
         /// Specific migration to run
@@ -170,8 +170,8 @@ enum MigrateCommands {
     /// Roll back applied migrations - only the most recent one unless --step says otherwise
     Down {
         /// Number of migrations to rollback (default: 1)
-        #[arg(long, default_value = "1")]
-        step: u32,
+        #[arg(long, conflicts_with = "migration", value_parser = clap::value_parser!(u32).range(1..))]
+        step: Option<u32>,
 
         /// Specific migration to rollback
         #[arg(long)]
@@ -189,7 +189,7 @@ enum MigrateCommands {
     /// Redo last migration (down then up)
     Redo {
         /// Number of migrations to redo
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
         step: u32,
 
         /// Pretend mode
@@ -208,7 +208,7 @@ enum MigrateCommands {
         seed: bool,
 
         /// Specific seeder to run
-        #[arg(long)]
+        #[arg(long, requires = "seed")]
         seeder: Option<String>,
 
         /// Force run in production
@@ -234,7 +234,7 @@ enum MigrateCommands {
         seed: bool,
 
         /// Number of migrations to refresh
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         step: Option<u32>,
 
         /// Force run in production
@@ -356,9 +356,9 @@ enum MakeCommands {
         )]
         tokenize: Option<bool>,
 
-        /// Output directory for the model file
-        #[arg(short, long, default_value = "src/models")]
-        output: String,
+        /// Output directory for the model file (defaults to [paths] models)
+        #[arg(short, long)]
+        output: Option<String>,
 
         /// Also generate a migration for this model
         #[arg(long)]
@@ -395,9 +395,9 @@ enum MakeCommands {
         #[arg(short, long)]
         fields: Option<String>,
 
-        /// Output directory
-        #[arg(short, long, default_value = "src/migrations")]
-        output: String,
+        /// Output directory (defaults to [paths] migrations)
+        #[arg(short, long)]
+        output: Option<String>,
     },
 
     /// Generate a new seeder
@@ -414,9 +414,9 @@ enum MakeCommands {
         #[arg(short = 'n', long, default_value = "10")]
         count: u32,
 
-        /// Output directory
-        #[arg(short, long, default_value = "src/seeders")]
-        output: String,
+        /// Output directory (defaults to [paths] seeders)
+        #[arg(short, long)]
+        output: Option<String>,
     },
 
     /// Generate a new factory
@@ -429,9 +429,9 @@ enum MakeCommands {
         #[arg(short, long)]
         model: Option<String>,
 
-        /// Output directory
-        #[arg(short, long, default_value = "src/factories")]
-        output: String,
+        /// Output directory (defaults to [paths] factories)
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -479,7 +479,7 @@ enum DbCommands {
         force: bool,
     },
 
-    /// Drop every table in the database (schema included - this is not a truncate)
+    /// Drop every table and view in the database (schema included - this is not a truncate)
     Wipe {
         /// Also drop user-defined enum types (PostgreSQL only; ignored elsewhere)
         #[arg(long)]
@@ -492,7 +492,7 @@ enum DbCommands {
 
     /// Show table information
     Table {
-        /// Table name
+        /// Table name (use schema.table on PostgreSQL)
         name: String,
     },
 
@@ -633,5 +633,67 @@ mod tests {
             model_flags(&["tideorm", "make", "model", "User", "--tokenize"]),
             (None, None, Some(true))
         );
+    }
+
+    #[test]
+    fn make_model_preserves_an_explicit_default_output_directory() {
+        let cli = Cli::try_parse_from(["tideorm", "make", "model", "User", "--output=src/models"])
+            .expect("make model should parse");
+
+        match cli.command {
+            Commands::Make(MakeCommands::Model { output, .. }) => {
+                assert_eq!(output.as_deref(), Some("src/models"));
+            }
+            _ => panic!("expected a `make model` command"),
+        }
+    }
+
+    #[test]
+    fn migration_step_cannot_be_combined_with_a_specific_migration() {
+        assert!(
+            Cli::try_parse_from([
+                "tideorm",
+                "migrate",
+                "up",
+                "--migration",
+                "0001_create_users",
+                "--step",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "tideorm",
+                "migrate",
+                "down",
+                "--migration",
+                "0001_create_users",
+                "--step",
+                "1",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_specific_fresh_seeder_requires_seeding() {
+        assert!(
+            Cli::try_parse_from(["tideorm", "migrate", "fresh", "--seeder", "UserSeeder",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_step_counts_must_be_positive() {
+        for args in [
+            vec!["tideorm", "migrate", "run", "--step", "0"],
+            vec!["tideorm", "migrate", "up", "--step", "0"],
+            vec!["tideorm", "migrate", "down", "--step", "0"],
+            vec!["tideorm", "migrate", "redo", "--step", "0"],
+            vec!["tideorm", "migrate", "refresh", "--step", "0"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 }

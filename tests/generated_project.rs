@@ -68,6 +68,12 @@ fn generated_project_builds_after_model_generation() -> Result<(), Box<dyn std::
         ])
         .assert()
         .success();
+    // A model with no unique field gets no method using the prelude it imports.
+    tideorm()?
+        .current_dir(&project_dir)
+        .args(["make", "model", "Tag", "--fields", "label:string"])
+        .assert()
+        .success();
 
     let output = Command::new("cargo")
         .args(["check", "--offline", "--all-targets"])
@@ -152,6 +158,29 @@ fn generated_sqlite_project_runs_its_seeders() -> Result<(), Box<dyn std::error:
         after.contains("skipped  demo_seeder (already ran)"),
         "{}",
         after
+    );
+
+    // The app itself loads `.env`, where `tideorm init` wrote `DATABASE_URL`: pointed
+    // at another file there, it opens that one rather than a built-in default. (Built
+    // here, where the seeder runner already compiled everything it needs.)
+    std::fs::write(
+        project_dir.join(".env"),
+        "DATABASE_URL=sqlite://from_env.db?mode=rwc\n",
+    )?;
+    let app = Command::new("cargo")
+        .args(["run", "--quiet", "--offline", "--bin", "seeded_app"])
+        .current_dir(&project_dir)
+        .env_remove("DATABASE_URL")
+        .output()?;
+    assert!(
+        app.status.success(),
+        "the generated app failed to start\n{}",
+        format_output(&app)
+    );
+    assert!(
+        project_dir.join("from_env.db").exists(),
+        "the generated app did not open the database its .env names\n{}",
+        format_output(&app)
     );
 
     Ok(())

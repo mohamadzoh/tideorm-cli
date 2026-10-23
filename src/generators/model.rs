@@ -10,9 +10,10 @@
 
 use crate::config::TideConfig;
 use crate::utils::{
-    FieldDefinition, RelationDefinition, RelationType, ensure_directory, ensure_writable,
-    escape_ident, pluralize, render_template, rust_type_for_field_type, to_pascal_case,
-    to_snake_case, validate_sql_object_name,
+    FieldDefinition, RelationDefinition, RelationType, append_source_block, auto_increments,
+    ensure_directory, ensure_writable, escape_ident, has_module_declaration, pluralize,
+    read_source_or_empty, render_template, rust_type_for_field_type, to_pascal_case, to_snake_case,
+    validate_rust_type_name, validate_sql_identifier, validate_sql_object_name,
 };
 use serde::Serialize;
 
@@ -210,11 +211,11 @@ impl<'a> ModelGenerator<'a> {
             return Err(self.parse_errors.join("\n"));
         }
 
-        // Ensure output directory exists
-        ensure_directory(&self.output_dir)?;
-
         // Generate file content
         let content = self.generate_content()?;
+
+        // Ensure output directory exists only after validation succeeds.
+        ensure_directory(&self.output_dir)?;
 
         // Write file
         let file_name = format!("{}.rs", to_snake_case(&self.name));
@@ -233,9 +234,25 @@ impl<'a> ModelGenerator<'a> {
 
     /// Generate the model file content
     fn generate_content(&self) -> Result<String, String> {
+        validate_rust_type_name("model", &self.name)?;
+
         // The table name is written into a `table = ".."` string literal, so a name
         // carrying a quote would inject arbitrary Rust into the generated model.
         validate_sql_object_name("table", &self.table_name())?;
+        self.validate_generated_fields()?;
+
+        for (kind, names) in [
+            ("translatable field", &self.translatable),
+            ("single attachment field", &self.attachments_single),
+            ("multiple attachment field", &self.attachments_multi),
+            ("indexed field", &self.indexed),
+            ("unique field", &self.unique),
+            ("nullable field", &self.nullable),
+        ] {
+            for name in names {
+                validate_sql_identifier(kind, name)?;
+            }
+        }
 
         let context = ModelTemplateContext {
             name: self.name.clone(),
@@ -251,6 +268,74 @@ impl<'a> ModelGenerator<'a> {
             self.config.model.template.as_deref(),
             &context,
         )
+    }
+
+    fn validate_generated_fields(&self) -> Result<(), String> {
+        let fields = self.generated_fields();
+        let primary_keys = fields
+            .iter()
+            .filter(|field| field.primary_key || field.name == self.config.model.primary_key)
+            .count();
+        if primary_keys > 1 {
+            return Err("A model can define only one primary key field".to_string());
+        }
+
+        for (kind, names) in [
+            ("translatable", &self.translatable),
+            ("indexed", &self.indexed),
+            ("unique", &self.unique),
+            ("nullable", &self.nullable),
+        ] {
+            for name in names {
+                if !fields.iter().any(|field| field.name == name.as_str()) {
+                    return Err(format!(
+                        "Unknown {kind} field '{}'; define it with --fields or a belongs_to relation",
+                        name
+                    ));
+                }
+            }
+        }
+
+        let mut names = Vec::new();
+        let mut add = |name: &str| {
+            if names
+                .iter()
+                .any(|existing: &String| existing.as_str() == name)
+            {
+                Err(format!(
+                    "Duplicate generated model field '{}'; rename the field or disable the generated field that uses this name",
+                    name
+                ))
+            } else {
+                names.push(name.to_string());
+                Ok(())
+            }
+        };
+
+        for field in &fields {
+            add(&field.name)?;
+        }
+        for relation in &self.relations {
+            add(&relation.name)?;
+        }
+        if !self.has_explicit_primary_key() {
+            add(&self.config.model.primary_key)?;
+        }
+        if !self.translatable.is_empty() {
+            add("translations")?;
+        }
+        if !self.attachments_single.is_empty() || !self.attachments_multi.is_empty() {
+            add("files")?;
+        }
+        if self.timestamps {
+            add("created_at")?;
+            add("updated_at")?;
+        }
+        if self.soft_deletes {
+            add("deleted_at")?;
+        }
+
+        Ok(())
     }
 
     /// Collect the `use super::..` imports for related models.
@@ -292,7 +377,16 @@ impl<'a> ModelGenerator<'a> {
         let table_name = self.table_name();
 
         let mut attributes = Vec::new();
-        let mut tide_attrs = vec![format!("table = \"{}\"", table_name)];
+        // A schema-qualified table is the model's `schema`: `table` is one name.
+        let mut tide_attrs = match crate::utils::split_table(&table_name) {
+            (Some(schema), table) => {
+                vec![
+                    format!("table = \"{table}\""),
+                    format!("schema = \"{schema}\""),
+                ]
+            }
+            (None, table) => vec![format!("table = \"{table}\"")],
+        };
 
         if self.soft_deletes {
             tide_attrs.push("soft_delete".to_string());
@@ -356,9 +450,15 @@ impl<'a> ModelGenerator<'a> {
         let mut fields = Vec::new();
 
         if !self.has_explicit_primary_key() {
+            // TideORM numbers only integer keys; a `Uuid` key gets a random value instead.
+            let attribute = if auto_increments(&self.config.model.primary_key_type) {
+                "#[tideorm(primary_key, auto_increment)]"
+            } else {
+                "#[tideorm(primary_key)]"
+            };
             fields.push(ModelFieldTemplateContext {
                 doc_comment: None,
-                attribute: Some("#[tideorm(primary_key, auto_increment)]".to_string()),
+                attribute: Some(attribute.to_string()),
                 // The configured type is a field type alias like every other one, so it has
                 // to go through the same mapper: `bigint` is `i64`, not a Rust type.
                 declaration: format!(
@@ -536,6 +636,7 @@ impl<'a> ModelGenerator<'a> {
             .cloned()
             .map(|mut field| {
                 field.nullable |= self.nullable.contains(&field.name);
+                field.unique |= self.unique.contains(&field.name);
                 field
             })
             .collect()
@@ -601,11 +702,10 @@ impl<'a> ModelGenerator<'a> {
         let file_stem = to_snake_case(&self.name);
         let module_name = escape_ident(&file_stem);
 
-        // Read existing content
-        let existing = std::fs::read_to_string(&mod_path).unwrap_or_default();
+        let existing = read_source_or_empty(&mod_path)?;
 
         // Check if already included
-        if existing.contains(&format!("pub mod {};", module_name)) {
+        if has_module_declaration(&existing, &module_name) {
             return Ok(());
         }
 
@@ -616,7 +716,7 @@ impl<'a> ModelGenerator<'a> {
             format!("#[path = \"{}.rs\"]\npub mod {};", file_stem, module_name)
         };
 
-        let new_content = format!("{}{}\n", existing, module_decl);
+        let new_content = append_source_block(&existing, &module_decl);
 
         std::fs::write(&mod_path, new_content)
             .map_err(|e| format!("Failed to update mod.rs: {}", e))?;
@@ -625,31 +725,42 @@ impl<'a> ModelGenerator<'a> {
     }
 }
 
+// The prelude stays for the code added to a model later, scopes, callbacks or
+// queries, though a model of plain columns uses none of it yet.
 const DEFAULT_MODEL_TEMPLATE: &str = r#"//! {{ name }} Model
 //!
 //! Auto-generated by TideORM CLI
 
+#[allow(unused_imports)]
 use tideorm::prelude::*;
-{% if related_imports %}
-
-{% for import in related_imports %}
+{%- for import in related_imports %}
 use super::{{ import.module }}::{{ import.name }};
-{% endfor %}{% endif %}
-
+{%- endfor %}
 {% for attribute in struct_attributes %}
 {{ attribute }}
-{% endfor %}
+{%- endfor %}
 pub struct {{ name }} {
-{% for field in struct_fields %}
-{% if field.doc_comment %}    {{ field.doc_comment }}
-{% endif %}{% if field.attribute %}    {{ field.attribute }}
-{% endif %}    {{ field.declaration }}
-{% endfor %}}
+{%- for field in struct_fields %}
+{%- if field.doc_comment %}
+    {{ field.doc_comment }}
+{%- endif %}
+{%- if field.attribute %}
+    {{ field.attribute }}
+{%- endif %}
+    {{ field.declaration }}
+{%- endfor %}
+}
+{%- if methods %}
 
 impl {{ name }} {
-{% for method in methods %}
+{%- for method in methods %}
+{%- if not loop.first %}
+{% endif %}
 {{ method }}
-{% endfor %}}
+{%- endfor %}
+}
+{%- endif %}
+
 "#;
 
 #[derive(Serialize)]
@@ -698,6 +809,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_auxiliary_field_names_before_rendering() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config)
+            .name("User")
+            .translatable(Some("title\"#]".to_string()));
+
+        assert!(generator.generate_content().is_err());
+    }
+
+    #[test]
+    fn supplemental_unique_fields_are_passed_to_generated_seeders() {
+        let config = TideConfig::default();
+        let generator = ModelGenerator::new(&config)
+            .name("User")
+            .fields(Some("active:bool".to_string()))
+            .unique(Some("active".to_string()));
+
+        assert!(generator.seed_fields()[0].unique);
+    }
+
+    #[test]
     fn test_field_parsing() {
         let field = FieldDefinition::parse("email:string:unique:indexed").unwrap();
         assert_eq!(field.name, "email");
@@ -718,11 +850,49 @@ mod tests {
         assert_eq!(rel.relation_type, RelationType::HasMany);
     }
 
+    /// `app.users` is table `users` in schema `app`, as the migration names it,
+    /// not one table name holding a dot.
+    #[test]
+    fn test_a_schema_qualified_table_is_the_models_schema() {
+        let config = TideConfig::default();
+        let content = ModelGenerator::new(&config)
+            .name("User")
+            .table(Some("app.users".to_string()))
+            .generate_content()
+            .unwrap();
+
+        assert!(
+            content.contains("#[tideorm::model(table = \"users\", schema = \"app\")]"),
+            "{content}"
+        );
+    }
+
+    /// A model of plain columns is laid out as rustfmt would write it, and its
+    /// prelude import, which nothing uses yet, warns nobody: a model without a
+    /// unique field broke a `-D warnings` build.
+    #[test]
+    fn test_a_plain_model_is_written_as_rustfmt_would() {
+        let mut config = TideConfig::default();
+        config.model.timestamps = false;
+        let content = ModelGenerator::new(&config)
+            .name("Post")
+            .fields(Some("title:string,views:i32:nullable".to_string()))
+            .indexed(Some("title".to_string()))
+            .generate_content()
+            .unwrap();
+
+        assert_eq!(
+            content,
+            "//! Post Model\n//!\n//! Auto-generated by TideORM CLI\n\n#[allow(unused_imports)]\nuse tideorm::prelude::*;\n\n#[tideorm::model(table = \"posts\")]\n#[index(\"title\")]\npub struct Post {\n    #[tideorm(primary_key, auto_increment)]\n    pub id: i64,\n    pub title: String,\n    #[tideorm(nullable)]\n    pub views: Option<i32>,\n}\n"
+        );
+    }
+
     #[test]
     fn test_generated_model_uses_correct_syntax() {
         let config = TideConfig::default();
         let generator = ModelGenerator::new(&config)
             .name("User")
+            .fields(Some("email:string".to_string()))
             .timestamps(true)
             .indexed(Some("email".to_string()))
             .unique(Some("email".to_string()));
@@ -776,6 +946,60 @@ mod tests {
             "#[tideorm::model(table = \"products\", translatable = \"name,description\")]"
         ));
         assert!(content.contains("pub translations: Option<JsonValue>,"));
+    }
+
+    #[test]
+    fn generated_field_name_collisions_are_rejected() {
+        let config = TideConfig::default();
+        for generator in [
+            ModelGenerator::new(&config)
+                .name("User")
+                .fields(Some("created_at:datetime".to_string())),
+            ModelGenerator::new(&config)
+                .name("User")
+                .relations(Some("created_at:has_one:Audit".to_string())),
+            ModelGenerator::new(&config)
+                .name("User")
+                .fields(Some("email:string,email:string".to_string()))
+                .timestamps(false),
+        ] {
+            let error = generator
+                .generate_content()
+                .expect_err("duplicate generated struct fields must be rejected");
+            assert!(error.contains("Duplicate generated model field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn models_reject_multiple_primary_key_fields() {
+        let config = TideConfig::default();
+        let error = ModelGenerator::new(&config)
+            .name("User")
+            .fields(Some("id:i64,tenant_id:i64:primary_key".to_string()))
+            .generate_content()
+            .expect_err("a generated model cannot have multiple primary keys");
+
+        assert!(error.contains("only one primary key"), "{error}");
+    }
+
+    #[test]
+    fn model_modifiers_must_reference_generated_columns() {
+        let config = TideConfig::default();
+        let error = ModelGenerator::new(&config)
+            .name("User")
+            .unique(Some("missing".to_string()))
+            .generate_content()
+            .expect_err("an index modifier for a missing column cannot be generated");
+
+        assert!(error.contains("Unknown unique field 'missing'"), "{error}");
+
+        let content = ModelGenerator::new(&config)
+            .name("Post")
+            .relations(Some("author:belongs_to:User".to_string()))
+            .indexed(Some("user_id".to_string()))
+            .generate_content()
+            .expect("a belongs_to relation generates its foreign-key column");
+        assert!(content.contains("#[index(\"user_id\")]"), "{content}");
     }
 
     #[test]
@@ -902,6 +1126,9 @@ mod tests {
             .unwrap();
 
         assert!(content.contains("pub id: Uuid,"));
+        // TideORM refuses `auto_increment` on a key that is not an integer.
+        assert!(content.contains("#[tideorm(primary_key)]"), "{content}");
+        assert!(!content.contains("auto_increment"), "{content}");
     }
 
     #[test]

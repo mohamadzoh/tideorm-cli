@@ -1,5 +1,6 @@
 //! Utility functions for TideORM CLI
 
+use crate::config::canonical_driver;
 use colored::Colorize;
 use minijinja::{AutoEscape, Environment};
 use serde::Serialize;
@@ -84,6 +85,61 @@ pub fn ensure_writable(path: &str) -> Result<(), String> {
     }
 }
 
+/// Whether `error`, from reading `path`, means there is nothing there yet:
+/// not found, below a directory or none, rather than below a file.
+pub(crate) fn is_missing_path(path: &Path, error: &std::io::Error) -> bool {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return false;
+    }
+
+    let mut ancestor = path.parent();
+    while let Some(parent) = ancestor {
+        match std::fs::metadata(parent) {
+            Ok(metadata) => return metadata.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = parent.parent();
+            }
+            Err(_) => return false,
+        }
+    }
+
+    true
+}
+
+pub fn read_source_or_empty(path: &str) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => Ok(source),
+        Err(error) if is_missing_path(Path::new(path), &error) => Ok(String::new()),
+        Err(error) => Err(format!("Failed to read {}: {}", path, error)),
+    }
+}
+
+pub fn append_source_block(existing: &str, block: &str) -> String {
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut updated = existing.to_string();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push_str(newline);
+    }
+
+    let block = block.replace("\r\n", "\n").replace('\n', newline);
+    updated.push_str(&block);
+    if !updated.ends_with('\n') {
+        updated.push_str(newline);
+    }
+    updated
+}
+
+pub fn has_module_declaration(source: &str, module: &str) -> bool {
+    let declaration = format!("pub mod {};", module);
+    source.lines().any(|line| {
+        line.split_once("//").map_or(line, |(code, _)| code).trim() == declaration.as_str()
+    })
+}
+
 /// Rust keywords that cannot be emitted as bare identifiers in generated code.
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "become", "box", "break", "const", "continue", "crate", "do", "dyn",
@@ -145,6 +201,13 @@ pub fn render_template<T: Serialize>(
 /// constraint of the migrations table.
 pub fn migration_timestamp() -> String {
     chrono::Utc::now().format("%Y%m%d%H%M%S%3f").to_string()
+}
+
+/// `message`, an error from connecting to `url`, with `url` masked wherever it shows.
+pub fn masked_connection_error(message: impl std::fmt::Display, url: &str) -> String {
+    message
+        .to_string()
+        .replace(url, &tideorm::internal::mask_url_credentials(url))
 }
 
 /// Derive the Rust module path that reaches a configured source directory.
@@ -209,6 +272,27 @@ pub fn validate_sql_identifier(kind: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a generated Rust type name, including type-only reserved names.
+pub fn validate_rust_type_name(kind: &str, name: &str) -> Result<(), String> {
+    validate_sql_identifier(kind, name)?;
+    if matches!(name, "Self" | "_") {
+        return Err(format!(
+            "Invalid {} name '{}': this is a reserved Rust type name",
+            kind, name
+        ));
+    }
+    Ok(())
+}
+
+/// The schema of a table named `schema.table`, if it has one, and its bare
+/// name.
+pub(crate) fn split_table(table: &str) -> (Option<&str>, &str) {
+    match table.rsplit_once('.') {
+        Some((schema, bare)) => (Some(schema), bare),
+        None => (None, table),
+    }
+}
+
 /// Validate a possibly schema qualified object name such as `public.users`.
 pub fn validate_sql_object_name(kind: &str, name: &str) -> Result<(), String> {
     for segment in name.split('.') {
@@ -227,8 +311,8 @@ pub fn quote_sql_identifier(driver: &str, kind: &str, name: &str) -> Result<Stri
 
     let quoted: Vec<String> = name
         .split('.')
-        .map(|segment| match driver {
-            "mysql" | "mariadb" => format!("`{}`", segment),
+        .map(|segment| match canonical_driver(driver) {
+            Some("mysql") => format!("`{}`", segment),
             _ => format!("\"{}\"", segment),
         })
         .collect();
@@ -324,11 +408,18 @@ fn validate_default_value(value: &str) -> Result<(), String> {
 
 /// The database type a configured driver name stands for.
 pub fn database_type(driver: &str) -> DatabaseType {
-    match driver {
-        "postgres" => DatabaseType::Postgres,
-        "mysql" => DatabaseType::MySQL,
+    match canonical_driver(driver) {
+        Some("postgres") => DatabaseType::Postgres,
+        Some("mysql") => DatabaseType::MySQL,
         _ => DatabaseType::SQLite,
     }
+}
+
+/// Whether the database numbers a primary key of `field_type`: an `i32` or `i64` key is
+/// auto-incremented, a key of any other type (a `uuid`, say) gets its value from the
+/// application. The model and its migration both decide by this, so they agree.
+pub fn auto_increments(field_type: &str) -> bool {
+    matches!(rust_type_for_field_type(field_type).as_str(), "i32" | "i64")
 }
 
 /// Map a field type name to its Rust type, ignoring nullability.
@@ -481,8 +572,12 @@ impl FieldDefinition {
     fn column_type(&self, driver: &str) -> Option<ColumnType> {
         Some(match self.field_type.to_lowercase().as_str() {
             "string" | "varchar" => ColumnType::String,
-            // MySQL cannot make a TEXT column unique without a key length.
-            "text" if driver == "mysql" && self.unique => ColumnType::String,
+            // MySQL cannot index a TEXT column, unique or not, without a key length.
+            "text"
+                if canonical_driver(driver) == Some("mysql") && (self.unique || self.indexed) =>
+            {
+                ColumnType::String
+            }
             "text" => ColumnType::Text,
             "i8" | "tinyint" | "i16" | "smallint" => ColumnType::SmallInteger,
             "i32" | "int" | "integer" => ColumnType::Integer,
@@ -538,16 +633,15 @@ impl FieldDefinition {
                 | "json_array"
         );
 
-        if is_array && driver != "postgres" {
+        let postgres = canonical_driver(driver) == Some("postgres");
+        if is_array && !postgres {
             return Err(format!(
                 "Field '{}' is a {}, which only PostgreSQL supports (this project uses {}). Store the list in a `json` field instead.",
                 self.name, self.field_type, driver
             ));
         }
 
-        if driver == "postgres"
-            && matches!(self.field_type.to_lowercase().as_str(), "i8" | "tinyint")
-        {
+        if postgres && matches!(self.field_type.to_lowercase().as_str(), "i8" | "tinyint") {
             return Err(format!(
                 "Field '{}' is an i8, which the PostgreSQL driver cannot bind. Use i16 (smallint) instead.",
                 self.name
@@ -587,14 +681,23 @@ impl RelationDefinition {
         }
 
         let name = parts[0].trim().to_string();
+        validate_sql_identifier("relation field", &name)?;
         let relation_type = match parts[1].trim().to_lowercase().as_str() {
             "belongs_to" | "belongsto" => RelationType::BelongsTo,
             "has_one" | "hasone" => RelationType::HasOne,
             "has_many" | "hasmany" => RelationType::HasMany,
             other => return Err(format!("Unknown relation type: {}", other)),
         };
-        let related_model = parts[2].trim().to_string();
-        let foreign_key = parts.get(3).map(|s| s.trim().to_string());
+        let related_model = to_pascal_case(parts[2].trim());
+        validate_rust_type_name("related model", &related_model)?;
+        let foreign_key = parts
+            .get(3)
+            .map(|value| value.trim().to_string())
+            .map(|foreign_key| {
+                validate_sql_identifier("foreign key", &foreign_key)?;
+                Ok::<_, String>(foreign_key)
+            })
+            .transpose()?;
 
         Ok(Self {
             name,
@@ -650,6 +753,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appending_generated_source_separates_declarations_and_preserves_line_endings() {
+        assert_eq!(
+            append_source_block("pub mod old;", "pub mod new;"),
+            "pub mod old;\npub mod new;\n"
+        );
+        assert_eq!(
+            append_source_block("pub mod old;\r\n", "#[path = \"new.rs\"]\npub mod new;"),
+            "pub mod old;\r\n#[path = \"new.rs\"]\r\npub mod new;\r\n"
+        );
+    }
+
+    #[test]
+    fn module_declaration_detection_ignores_comments_but_accepts_inline_comments() {
+        assert!(!has_module_declaration("// pub mod user;", "user"));
+        assert!(has_module_declaration("pub mod user; // models", "user"));
+    }
+
+    #[test]
+    fn rust_type_names_reject_invalid_and_reserved_identifiers() {
+        assert!(validate_rust_type_name("model", "User").is_ok());
+        assert!(validate_rust_type_name("model", "123User").is_err());
+        assert!(validate_rust_type_name("model", "Self").is_err());
+        assert!(validate_rust_type_name("model", "_").is_err());
+    }
+
+    #[test]
+    fn reading_unusable_source_does_not_treat_it_as_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.rs");
+        std::fs::write(&path, [0xff]).unwrap();
+
+        assert!(read_source_or_empty(path.to_str().unwrap()).is_err());
+    }
 
     #[test]
     fn test_pluralize() {
@@ -830,6 +968,26 @@ mod tests {
         assert!(error.contains("Invalid table name"));
     }
 
+    /// An unknown driver used to fall through to SQLite, so a `mariadb://` project
+    /// generated SQLite DDL.
+    #[test]
+    fn test_mariadb_and_postgresql_map_to_their_database_types() {
+        assert_eq!(database_type("mariadb"), DatabaseType::MySQL);
+        assert_eq!(database_type("MySQL"), DatabaseType::MySQL);
+        assert_eq!(database_type("postgresql"), DatabaseType::Postgres);
+        assert_eq!(database_type("sqlite"), DatabaseType::SQLite);
+    }
+
+    #[test]
+    fn test_only_integer_keys_auto_increment() {
+        for field_type in ["i64", "bigint", "i32", "integer"] {
+            assert!(auto_increments(field_type), "{field_type}");
+        }
+        for field_type in ["uuid", "string", "i16"] {
+            assert!(!auto_increments(field_type), "{field_type}");
+        }
+    }
+
     #[test]
     fn test_escape_ident_handles_keywords() {
         assert_eq!(escape_ident("email"), "email");
@@ -869,5 +1027,37 @@ mod tests {
         assert_eq!(rel.name, "user");
         assert_eq!(rel.relation_type, RelationType::BelongsTo);
         assert_eq!(rel.foreign_key, Some("user_id".to_string()));
+
+        let lowercase = RelationDefinition::parse("posts:has_many:post").unwrap();
+        assert_eq!(lowercase.related_model, "Post");
+        assert!(RelationDefinition::parse("posts\"#]:has_many:Post").is_err());
+        assert!(RelationDefinition::parse("posts:belongs_to:Post:bad-name").is_err());
+    }
+
+    /// A password holding `?`, `#` or `/` is masked whole; TideORM 0.15.0 cut the URL
+    /// at the `?` and printed the rest of the password.
+    #[test]
+    fn urls_mask_every_spelling_of_a_password() {
+        use tideorm::internal::mask_url_credentials;
+
+        for (url, shown) in [
+            (
+                "postgres://app:p?ss#w/rd@db.internal:5432/app?sslmode=require",
+                "postgres://***@db.internal:5432/app?sslmode=require",
+            ),
+            ("postgres://app:secret@db/app", "postgres://***@db/app"),
+            (
+                "postgres://db/app?user=app&password=hunter2",
+                "postgres://db/app?user=app&password=***",
+            ),
+            ("sqlite://app.db", "sqlite://app.db"),
+        ] {
+            assert_eq!(mask_url_credentials(url), shown);
+        }
+
+        let url = "mysql://root:p?ss@db.internal/app";
+        let error = masked_connection_error(format!("could not reach {url}"), url);
+        assert!(!error.contains("ss@"), "{error}");
+        assert!(error.contains("mysql://***@db.internal/app"), "{error}");
     }
 }

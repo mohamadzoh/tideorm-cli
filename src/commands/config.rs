@@ -32,9 +32,9 @@ pub async fn show(config_path: &str, verbose: bool) -> Result<(), String> {
                 "  sqlite_path = \"{}\"",
                 config
                     .database
-                    .sqlite_path
+                    .sqlite_file()
                     .as_deref()
-                    .unwrap_or("database.db")
+                    .unwrap_or(":memory:")
             );
         }
         _ => {

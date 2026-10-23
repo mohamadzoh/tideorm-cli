@@ -2,7 +2,8 @@
 
 use crate::config::TideConfig;
 use crate::utils::{
-    crate_module_path, ensure_directory, ensure_writable, escape_ident, to_snake_case,
+    append_source_block, crate_module_path, ensure_directory, ensure_writable, escape_ident,
+    has_module_declaration, read_source_or_empty, to_snake_case, validate_rust_type_name,
 };
 
 /// Factory generator
@@ -43,13 +44,16 @@ impl<'a> FactoryGenerator<'a> {
 
     /// Generate a factory file
     pub fn generate(&self, name: &str, model: Option<String>) -> Result<String, String> {
-        ensure_directory(self.factories_dir())?;
+        if name.trim().is_empty() {
+            return Err("Factory name is required".to_string());
+        }
 
         let factory_name = if name.ends_with("Factory") {
             to_pascal_case(name)
         } else {
             format!("{}Factory", to_pascal_case(name))
         };
+        validate_rust_type_name("factory", &factory_name)?;
 
         let file_name = format!("{}.rs", to_snake_case(&factory_name));
         let file_path = format!("{}/{}", self.factories_dir(), file_name);
@@ -60,6 +64,8 @@ impl<'a> FactoryGenerator<'a> {
                 .unwrap_or(&factory_name)
                 .to_string()
         });
+        validate_rust_type_name("model", &to_pascal_case(&model_name))?;
+        ensure_directory(self.factories_dir())?;
 
         let content = self.generate_factory(&factory_name, &model_name);
 
@@ -137,9 +143,9 @@ impl {factory_name} {{
     where
         F: FnOnce(&mut {model_pascal}),
     {{
-        let mut {model_snake} = Self::definition();
-        modifier(&mut {model_snake});
-        {model_snake}
+        let mut record = Self::definition();
+        modifier(&mut record);
+        record
     }}
 
     /// Create and save a {model_pascal} with custom attributes
@@ -188,14 +194,14 @@ mod tests {{
         let mod_path = format!("{}/mod.rs", self.factories_dir());
         let module_name = to_snake_case(factory_name);
 
-        let existing = std::fs::read_to_string(&mod_path).unwrap_or_default();
+        let existing = read_source_or_empty(&mod_path)?;
 
-        let module_decl = format!("pub mod {};", module_name);
-        if existing.contains(&module_decl) {
+        if has_module_declaration(&existing, &module_name) {
             return Ok(());
         }
 
-        let new_content = format!("{}{}\n", existing, module_decl);
+        let module_decl = format!("pub mod {};", module_name);
+        let new_content = append_source_block(&existing, &module_decl);
 
         std::fs::write(&mod_path, new_content)
             .map_err(|e| format!("Failed to update mod.rs: {}", e))?;
@@ -227,6 +233,18 @@ mod tests {
 
         assert!(content.contains("use crate::domain::models::user::User;"));
         assert!(!content.contains("use crate::models::"));
+    }
+
+    /// The record was bound to the model's snake-cased name, which for `Match` is
+    /// `let mut match`, and the factory did not compile.
+    #[test]
+    fn factory_for_a_keyword_named_model_compiles() {
+        let config = TideConfig::default();
+        let content = FactoryGenerator::new(&config).generate_factory("MatchFactory", "Match");
+
+        assert!(content.contains("use crate::models::r#match::Match;"));
+        assert!(content.contains("let mut record = Self::definition();"));
+        assert!(!content.contains("let mut match"), "{content}");
     }
 
     #[test]

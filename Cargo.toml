@@ -1,6 +1,6 @@
 [package]
 name = "tideorm-cli"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2024"
 description = "Command-line interface for TideORM"
 authors = ["Mohamad Al Zohbie"]
@@ -33,6 +33,9 @@ colored = "3.1.1"
 
 # Regex for parsing
 regex = "1.12.3"
+syn = { version = "2.0.117", features = ["full"] }
+# Source positions for the code a migration error quotes
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 
 # String case conversion
 heck = "0.5.0"
@@ -47,7 +50,7 @@ minijinja = "2.18.0"
 dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
 
 # Local TideORM runtime for live database access
-tideorm = { version = "0.15.0", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio"] }
+tideorm = { version = "0.16.0", default-features = false, features = ["postgres", "mysql", "sqlite", "runtime-tokio"] }
 
 [features]
 default = []
