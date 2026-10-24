@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.1
+
+- Track TideORM `0.16.2`, a performance and maintenance release with no API changes. The CLI
+  builds on it, and new projects pin it through `SCAFFOLD_TIDEORM_VERSION`.
+
 ## 0.11.0
 
 - New projects pin TideORM `0.16.0` through `SCAFFOLD_TIDEORM_VERSION`. It is breaking for library
