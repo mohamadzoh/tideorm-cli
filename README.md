@@ -53,7 +53,6 @@ models = "src/models"
 migrations = "src/migrations"
 seeders = "src/seeders"
 factories = "src/factories"
-config_file = "src/config.rs"
 
 [migration]
 table = "_migrations"
@@ -77,10 +76,9 @@ tideorm migrate                   # Same as `tideorm migrate run`
 tideorm migrate run
 
 # Run migrations with options
-tideorm migrate run --pretend     # Show SQL without executing (never contacts the database)
+tideorm migrate run --pretend     # Show the SQL without running it (reads the ledger)
 tideorm migrate run --force       # Force run in production
 tideorm migrate run --step=3      # Run only 3 migrations
-tideorm migrate run --path=other/migrations   # Run migrations from another directory
 
 # Generate a new migration
 tideorm migrate generate create_users_table   # alias: `gen`
@@ -120,7 +118,7 @@ tideorm migrate reset --force     # Force run in production
 # Refresh migrations (reset + migrate)
 tideorm migrate refresh
 tideorm migrate refresh --seed    # Also run seeders after
-tideorm migrate refresh --step=3  # Roll back and re-run only the last 3 migrations
+tideorm migrate refresh --step=3  # Roll back and re-run only the last 3 migrations (no --seed)
 tideorm migrate refresh --force   # Force run in production
 
 # Reconcile the migration ledger without running any SQL
@@ -140,6 +138,9 @@ tideorm migrate history --limit=25   # Default: 10, most recently applied first
 Rollback order follows the order migrations were *applied*, not their version
 strings, so a migration merged in from a long-lived branch is rolled back in the
 order it actually ran.
+
+Migrations are Rust code in your project, so these commands run them through the
+project's migration runner; see "Migrations" below.
 
 ### Model Generation
 
@@ -163,6 +164,8 @@ tideorm make model User --fields="name:string,email:string:unique,age:i32:nullab
 #    bigint, float, double, boolean, timestamp, blob, binary, integer_array,
 #    string_array, boolean_array)
 # Field modifiers: nullable, unique, indexed, primary_key, auto_increment, default=value
+# A `,` or `:` inside parentheses or a quoted SQL default stays in the field:
+#   --fields="price:DECIMAL(10, 2),opens:time:default='09:00:00'"
 
 # Model with relations
 tideorm make model Post --relations="user:belongs_to:User,comments:has_many:Comment"
@@ -254,7 +257,7 @@ tideorm db fresh --force  # Skip the confirmation prompt (required in production
 # Show database connection status
 tideorm db status
 
-# Initialize TideORM metadata tables
+# Create the migrations ledger, through the migration runner
 tideorm db check
 
 # Create the database
@@ -317,7 +320,10 @@ plain `cargo run` on your app - and `tideorm make seeder` registers each new see
 
 3. Create `src/bin/my-app-seed.rs`, named after your package so that two projects
    installed with `cargo install` do not collide. `--list` prints the seeders' names,
-   which the CLI checks `--seeder` against before it changes anything:
+   which the CLI checks `--seeder` against before it changes anything. It connects
+   with your app's `TideConfig` (`tideorm_config()` here) through `connect_only()`,
+   which skips the startup work that configuration enables (sync, migrations, seeds,
+   a schema file):
 
    ```rust
    #[tokio::main]
@@ -331,10 +337,17 @@ plain `cargo run` on your app - and `tideorm make seeder` registers each new see
            return Ok(());
        }
 
-       my_app::config::connect_tideorm().await?;
-       let result = match name {
-           Some(name) => seeders.run_seed(&name).await?,
-           None => seeders.run().await?,
+       // Without the application's startup work: a `force_sync` there would drop
+       // the tables before the seeders fill them.
+       my_app::config::tideorm_config().connect_only().await?;
+       let outcome = match name {
+           Some(name) => Ok(seeders.run_seed(&name).await?),
+           None => seeders.run().await,
+       };
+       // A failed run still lists the seeders it ran before the failure.
+       let (result, outcome) = match outcome {
+           Ok(result) => (result, Ok(())),
+           Err(failure) => (*failure.result, Err(failure.error)),
        };
 
        for seed in &result.executed {
@@ -343,7 +356,151 @@ plain `cargo run` on your app - and `tideorm make seeder` registers each new see
        for seed in &result.skipped {
            println!("  skipped  {} (already ran)", seed.name);
        }
+       outcome?;
        Ok(())
+   }
+   ```
+
+### Migrations
+
+Migrations are Rust code too, so `tideorm migrate` runs them the way `db seed` runs
+seeders: through a binary named after the package - for `my-app`, `cargo run --bin
+my-app-migrate` - with `DATABASE_URL` set to the database the CLI resolved. The runner
+runs the `Migrator` that `migrations::all()` returns, recording applied migrations in
+the `[migration] table` ledger, and prints what each command did as tab-separated
+lines the CLI reads back. Each migration commits on its own, so a command that fails
+part-way still lists the migrations it applied or rolled back before the failure.
+`tideorm db check` creates the ledger through it.
+
+`tideorm make migration` (and `make model --migration`) writes each migration with
+TideORM's `Schema` builder, which renders it for the database it runs on, and
+registers it in `migrations::all()`. A table may be named with its schema,
+`app.users`: a PostgreSQL schema or a MySQL/MariaDB database; SQLite ignores the
+schema part. `--pretend` hands each migration a `Schema` that collects its statements
+instead of running them, inside a transaction that is rolled back. It connects to read
+the ledger (and creates the ledger if it is missing), and what a migration runs other
+than through `schema` is rolled back too, except DDL on MySQL and MariaDB, which
+commits as it runs.
+
+`tideorm init` writes the runner and the registry. To add them to an existing project:
+
+1. Lay the project out as step 1 of "Seeding" describes, with `pub mod migrations;`
+   in `src/lib.rs`.
+2. Give `src/migrations/mod.rs` a registry. `tideorm make migration` adds each new
+   migration below `Migrator::new()`, so keep that on the line after the signature:
+
+   ```rust
+   #[path = "0001_create_users_table.rs"]
+   pub mod m_0001_create_users_table;
+
+   use tideorm::prelude::*;
+
+   pub fn all() -> Migrator {
+       Migrator::new()
+           .add(m_0001_create_users_table::CreateUsersTable)
+   }
+   ```
+
+3. Create `src/bin/my-app-migrate.rs`:
+
+   ```rust
+   //! Migration runner: `tideorm migrate` runs this binary.
+   //!
+   //! It runs `migrations::all()`, recording them in the ledger table its first
+   //! argument names, and prints what a command did as tab-separated lines that
+   //! `tideorm` reads back: `applied`, `pending` or `rolled_back`, then the
+   //! version and the name.
+
+   use std::process::ExitCode;
+   use tideorm::prelude::*;
+
+   #[tokio::main]
+   async fn main() -> ExitCode {
+       let args: Vec<String> = std::env::args().skip(1).collect();
+       match run(&args).await {
+           Ok(()) => ExitCode::SUCCESS,
+           Err(error) => {
+               eprintln!("{error}");
+               ExitCode::FAILURE
+           }
+       }
+   }
+
+   async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+       let [table, command, names @ ..] = args else {
+           return Err("usage: <ledger table> <command> [migration ..]".into());
+       };
+       let steps = || -> Result<usize, Box<dyn std::error::Error>> {
+           Ok(names.first().ok_or("missing the number of steps")?.parse()?)
+       };
+       // Without the application's startup work, which would sync, migrate or
+       // seed before this command runs.
+       my_app::config::tideorm_config().connect_only().await?;
+       let migrator = my_app::migrations::all().migrations_table(table.as_str());
+
+       match command.as_str() {
+           "run" => report(migrator.run().await)?,
+           "run-steps" => report(migrator.run_steps(steps()?).await)?,
+           "rollback-steps" => report(migrator.rollback_steps(steps()?).await)?,
+           "reset" => report(migrator.reset().await)?,
+           "refresh" => report(migrator.refresh().await)?,
+           "up" => {
+               for name in names {
+                   report(Ok(migrator.run_one(name).await?))?;
+               }
+           }
+           "down" => {
+               for name in names {
+                   report(Ok(migrator.rollback_one(name).await?))?;
+               }
+           }
+           "mark" | "unmark" => {
+               for name in names {
+                   migrator.mark(name, command == "mark").await?;
+               }
+           }
+           "pretend-up" | "pretend-down" => {
+               let up = command == "pretend-up";
+               for name in names {
+                   println!("\n-- Migration: {name}\n-- {}:", if up { "Up" } else { "Down" });
+                   for statement in migrator.pretend(name, up).await? {
+                       println!("{statement};");
+                   }
+               }
+           }
+           "status" => {
+               for migration in migrator.status().await? {
+                   let state = if migration.applied { "applied" } else { "pending" };
+                   println!("{state}\t{}\t{}", migration.version, migration.name);
+               }
+           }
+           "history" => {
+               for migration in migrator.applied().await? {
+                   println!(
+                       "applied\t{}\t{}\t{}",
+                       migration.version, migration.name, migration.applied_at
+                   );
+               }
+           }
+           other => return Err(format!("unknown command `{other}`").into()),
+       }
+       Ok(())
+   }
+
+   /// Print what a command rolled back and applied, a failed one's work before
+   /// its failure included, and pass the failure on.
+   fn report(outcome: Result<MigrationResult, MigrationFailure>) -> tideorm::Result<()> {
+       let (result, outcome) = match outcome {
+           Ok(result) => (result, Ok(())),
+           Err(failure) => (*failure.result, Err(failure.error)),
+       };
+       for migration in &result.rolled_back {
+           println!("rolled_back\t{}\t{}", migration.version, migration.name);
+       }
+       for migration in &result.applied {
+           println!("applied\t{}\t{}", migration.version, migration.name);
+       }
+       outcome
    }
    ```
 
@@ -425,17 +582,23 @@ impl User {
 
 ### Generated Migration
 
+`tideorm make migration create_users_table --create=users --fields="name:string,email:string:unique,age:i32:nullable"`
+with timestamps on writes:
+
 ```rust
 //! Migration: create_users_table
+//!
+//! Creates the users table.
 
 use tideorm::prelude::*;
 
+/// Migration: create_users_table
 pub struct CreateUsersTable;
 
 #[async_trait]
 impl Migration for CreateUsersTable {
     fn version(&self) -> &str {
-        "202603160001"
+        "20260316203329001"
     }
 
     fn name(&self) -> &str {
@@ -443,22 +606,22 @@ impl Migration for CreateUsersTable {
     }
 
     async fn up(&self, schema: &mut Schema) -> tideorm::Result<()> {
-        schema.raw(r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id BIGSERIAL PRIMARY KEY,
-            name VARCHAR(255) NOT NULL,
-            email VARCHAR(255) NOT NULL UNIQUE,
-            age INT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        "#).await?;
-        
+        schema
+            .create_table_if_not_exists("users", |t| {
+                t.big_increments("id");
+                t.string("name").not_null();
+                t.string("email").not_null().unique();
+                t.integer("age").nullable();
+                t.timestamps();
+            })
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, schema: &mut Schema) -> tideorm::Result<()> {
-        schema.raw(r#"DROP TABLE IF EXISTS users"#).await?;
+        schema.drop_table_if_exists("users").await?;
+
         Ok(())
     }
 }

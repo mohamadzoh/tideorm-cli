@@ -19,7 +19,8 @@ fn format_output(output: &std::process::Output) -> String {
     )
 }
 
-/// Scaffold a SQLite project that builds against the sibling `tideorm` checkout.
+/// Scaffold a SQLite project. With a `tideorm` checkout beside the CLI's, it builds
+/// against that checkout; without one (CI), against crates.io, as a user's would.
 fn init_sqlite_project(project_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     tideorm()?
         .env("TIDEORM_NONINTERACTIVE", "1")
@@ -35,9 +36,11 @@ fn init_sqlite_project(project_dir: &std::path::Path) -> Result<(), Box<dyn std:
     let tideorm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("CLI crate should have a parent directory")
-        .join("tideorm")
-        .to_string_lossy()
-        .replace('\\', "/");
+        .join("tideorm");
+    if !tideorm_path.join("Cargo.toml").exists() {
+        return Ok(());
+    }
+    let tideorm_path = tideorm_path.to_string_lossy().replace('\\', "/");
     let cargo_toml_path = project_dir.join("Cargo.toml");
     let mut cargo_toml = std::fs::read_to_string(&cargo_toml_path)?;
     cargo_toml.push_str(&format!(
@@ -210,6 +213,7 @@ fn generated_model_and_migration_agree_on_digit_columns() -> Result<(), Box<dyn 
 
     let migrate = tideorm()?
         .current_dir(&project_dir)
+        .env("CARGO_NET_OFFLINE", "true")
         .args(["migrate", "run"])
         .output()?;
     assert!(
@@ -289,74 +293,157 @@ fn interactive_init_accepts_scripted_mysql_answers() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// `tideorm migrate` runs the project's migrations through its migration
+/// runner, which records them in the ledger, without the app's startup work.
 #[test]
-fn generated_sqlite_project_tracks_migrations_across_repeated_runs()
--> Result<(), Box<dyn std::error::Error>> {
+fn generated_sqlite_project_runs_its_migrations() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let project_dir = temp_dir.path().join("sqlite_app");
-    let project_dir_arg = project_dir.to_string_lossy().into_owned();
+    init_sqlite_project(&project_dir)?;
 
-    tideorm()?
-        .env("TIDEORM_NONINTERACTIVE", "1")
-        .args(["init", &project_dir_arg, "--database", "sqlite"])
-        .assert()
-        .success();
+    // Startup work the app's configuration enables, which the runner skips.
+    let config_rs = project_dir.join("src").join("config.rs");
+    let config = std::fs::read_to_string(&config_rs)?;
+    assert!(config.contains(".min_connections(1)"), "{config}");
+    std::fs::write(
+        &config_rs,
+        config.replace(
+            ".min_connections(1)",
+            ".min_connections(1)\n        .schema_file(\"startup_schema.sql\")",
+        ),
+    )?;
+    let schema_file = project_dir.join("startup_schema.sql");
 
-    tideorm()?
-        .current_dir(&project_dir)
-        .args([
-            "make",
-            "migration",
+    for args in [
+        [
             "create_users_table",
             "--create=users",
             "--fields=name:string,email:string:unique",
-        ])
+        ],
+        [
+            "add_age_to_users",
+            "--table=users",
+            "--fields=age:i32:nullable",
+        ],
+    ] {
+        tideorm()?
+            .current_dir(&project_dir)
+            .args(["make", "migration"])
+            .args(args)
+            .assert()
+            .success();
+    }
+
+    let run = |args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let output = tideorm()?
+            .current_dir(&project_dir)
+            .env("CARGO_NET_OFFLINE", "true")
+            .args(args)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "tideorm {} failed\n{}",
+            args.join(" "),
+            format_output(&output)
+        );
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+
+    // Pretending shows the SQL and changes nothing.
+    let pretend = run(&["migrate", "run", "--pretend"])?;
+    assert!(pretend.contains("CREATE TABLE"), "{pretend}");
+    let status = run(&["migrate", "status"])?;
+    assert!(
+        status.contains("Total: 2 | Ran: 0 | Pending: 2"),
+        "{status}"
+    );
+
+    let first = run(&["migrate", "run"])?;
+    assert!(first.contains("Ran 2 migration(s) successfully"), "{first}");
+    let second = run(&["migrate", "run"])?;
+    assert!(second.contains("Nothing to migrate"), "{second}");
+
+    let history = run(&["migrate", "history"])?;
+    assert!(history.contains("create_users_table"), "{history}");
+    assert!(history.contains("add_age_to_users"), "{history}");
+
+    let down = run(&["migrate", "down"])?;
+    assert!(down.contains("Rolling back: "), "{down}");
+    assert!(down.contains("_add_age_to_users"), "{down}");
+    let status = run(&["migrate", "status"])?;
+    assert!(
+        status.contains("Total: 2 | Ran: 1 | Pending: 1"),
+        "{status}"
+    );
+
+    let redo = run(&["migrate", "redo"])?;
+    assert!(redo.contains("Redid 1 migration(s)"), "{redo}");
+    assert!(redo.contains("_create_users_table"), "{redo}");
+
+    let up = run(&["migrate", "up", "--migration", "add_age_to_users"])?;
+    assert!(up.contains("completed"), "{up}");
+    let check = run(&["db", "check"])?;
+    assert!(check.contains("2 registered"), "{check}");
+    assert!(
+        !schema_file.exists(),
+        "the migration runner ran the app's startup work"
+    );
+
+    // A batch that fails part-way reports the migrations it applied before
+    // the failure: each commits on its own, so they stay applied.
+    tideorm()?
+        .current_dir(&project_dir)
+        .args(["make", "migration", "break_the_batch"])
         .assert()
         .success();
-
-    let first_run = tideorm()?
+    let broken = std::fs::read_dir(project_dir.join("src").join("migrations"))?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with("_break_the_batch.rs"))
+        .expect("the migration should be generated");
+    let source = std::fs::read_to_string(&broken)?;
+    std::fs::write(
+        &broken,
+        source.replacen(
+            "let _ = schema; // Remove once implemented.",
+            "schema.raw(\"NOT A STATEMENT\").await?;",
+            1,
+        ),
+    )?;
+    run(&["migrate", "reset"])?;
+    let failed = tideorm()?
         .current_dir(&project_dir)
+        .env("CARGO_NET_OFFLINE", "true")
         .args(["migrate", "run"])
         .output()?;
+    let report = format_output(&failed);
+    assert!(!failed.status.success(), "{report}");
+    assert!(report.contains("Migration failed"), "{report}");
+    let migrated: Vec<&str> = report
+        .lines()
+        .filter(|line| line.contains("Migrating: "))
+        .collect();
+    assert_eq!(migrated.len(), 2, "{report}");
+    assert!(migrated[0].contains("_create_users_table"), "{report}");
+    assert!(migrated[1].contains("_add_age_to_users"), "{report}");
+    let status = run(&["migrate", "status"])?;
     assert!(
-        first_run.status.success(),
-        "first migrate run failed\n{}",
-        format_output(&first_run)
+        status.contains("Total: 3 | Ran: 2 | Pending: 1"),
+        "{status}"
     );
 
-    let second_run = tideorm()?
+    // The app itself still does its startup work.
+    let app = Command::new("cargo")
+        .args(["run", "--quiet", "--offline", "--bin", "sqlite_app"])
         .current_dir(&project_dir)
-        .args(["migrate", "run"])
+        .env_remove("DATABASE_URL")
         .output()?;
     assert!(
-        second_run.status.success(),
-        "second migrate run failed\n{}",
-        format_output(&second_run)
+        app.status.success(),
+        "the generated app failed to start\n{}",
+        format_output(&app)
     );
-
-    let second_stdout = String::from_utf8_lossy(&second_run.stdout);
-    assert!(
-        second_stdout.contains("Nothing to migrate"),
-        "expected second run to skip applied migration\n{}",
-        format_output(&second_run)
-    );
-
-    let history = tideorm()?
-        .current_dir(&project_dir)
-        .args(["migrate", "history"])
-        .output()?;
-    assert!(
-        history.status.success(),
-        "migrate history failed\n{}",
-        format_output(&history)
-    );
-
-    let history_stdout = String::from_utf8_lossy(&history.stdout);
-    assert!(
-        history_stdout.contains("create_users_table"),
-        "expected migration history to include the applied migration\n{}",
-        format_output(&history)
-    );
+    assert!(schema_file.exists(), "{}", format_output(&app));
 
     Ok(())
 }

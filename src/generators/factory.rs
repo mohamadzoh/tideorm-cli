@@ -1,9 +1,10 @@
 //! Factory generator for TideORM CLI
 
 use crate::config::TideConfig;
+use crate::generators::Generated;
 use crate::utils::{
-    append_source_block, crate_module_path, ensure_directory, ensure_writable, escape_ident,
-    has_module_declaration, read_source_or_empty, to_snake_case, validate_rust_type_name,
+    crate_module_path, declare_module, ensure_writable, escape_ident, to_pascal_case,
+    to_snake_case, validate_rust_type_name,
 };
 
 /// Factory generator
@@ -44,6 +45,11 @@ impl<'a> FactoryGenerator<'a> {
 
     /// Generate a factory file
     pub fn generate(&self, name: &str, model: Option<String>) -> Result<String, String> {
+        self.render(name, model)?.write()
+    }
+
+    /// Check and render a factory file without writing anything.
+    pub fn render(&self, name: &str, model: Option<String>) -> Result<Generated<'_>, String> {
         if name.trim().is_empty() {
             return Err("Factory name is required".to_string());
         }
@@ -55,8 +61,8 @@ impl<'a> FactoryGenerator<'a> {
         };
         validate_rust_type_name("factory", &factory_name)?;
 
-        let file_name = format!("{}.rs", to_snake_case(&factory_name));
-        let file_path = format!("{}/{}", self.factories_dir(), file_name);
+        let file_stem = to_snake_case(&factory_name);
+        let file_path = format!("{}/{}.rs", self.factories_dir(), file_stem);
 
         let model_name = model.unwrap_or_else(|| {
             factory_name
@@ -65,19 +71,14 @@ impl<'a> FactoryGenerator<'a> {
                 .to_string()
         });
         validate_rust_type_name("model", &to_pascal_case(&model_name))?;
-        ensure_directory(self.factories_dir())?;
 
         let content = self.generate_factory(&factory_name, &model_name);
 
         ensure_writable(&file_path)?;
 
-        std::fs::write(&file_path, content)
-            .map_err(|e| format!("Failed to write factory file: {}", e))?;
-
-        // Update mod.rs
-        self.update_mod_file(&factory_name)?;
-
-        Ok(file_path)
+        Ok(Generated::new(file_path, content, move || {
+            declare_module(self.factories_dir(), &file_stem)
+        }))
     }
 
     /// Generate factory content
@@ -175,7 +176,9 @@ mod tests {{
 
     #[test]
     fn test_with_modifier() {{
-        let _{model_snake} = {factory_name}::with(|_r| {{}});
+        let mut modified = false;
+        let _{model_snake} = {factory_name}::with(|_record| modified = true);
+        assert!(modified, "with() runs its modifier on the record");
     }}
 }}
 "#,
@@ -188,78 +191,8 @@ mod tests {{
             factory_name = factory_name,
         )
     }
-
-    /// Update mod.rs with new factory
-    fn update_mod_file(&self, factory_name: &str) -> Result<(), String> {
-        let mod_path = format!("{}/mod.rs", self.factories_dir());
-        let module_name = to_snake_case(factory_name);
-
-        let existing = read_source_or_empty(&mod_path)?;
-
-        if has_module_declaration(&existing, &module_name) {
-            return Ok(());
-        }
-
-        let module_decl = format!("pub mod {};", module_name);
-        let new_content = append_source_block(&existing, &module_decl);
-
-        std::fs::write(&mod_path, new_content)
-            .map_err(|e| format!("Failed to update mod.rs: {}", e))?;
-
-        Ok(())
-    }
-}
-
-/// Convert string to PascalCase
-fn to_pascal_case(s: &str) -> String {
-    heck::AsPascalCase(s).to_string()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::FactoryGenerator;
-    use crate::config::TideConfig;
-
-    #[test]
-    fn factory_imports_from_the_configured_models_path() {
-        let mut config = TideConfig::default();
-        let generator = FactoryGenerator::new(&config);
-        let content = generator.generate_factory("UserFactory", "User");
-        assert!(content.contains("use crate::models::user::User;"));
-
-        config.paths.models = "src/domain/models".to_string();
-        let generator = FactoryGenerator::new(&config);
-        let content = generator.generate_factory("UserFactory", "User");
-
-        assert!(content.contains("use crate::domain::models::user::User;"));
-        assert!(!content.contains("use crate::models::"));
-    }
-
-    /// The record was bound to the model's snake-cased name, which for `Match` is
-    /// `let mut match`, and the factory did not compile.
-    #[test]
-    fn factory_for_a_keyword_named_model_compiles() {
-        let config = TideConfig::default();
-        let content = FactoryGenerator::new(&config).generate_factory("MatchFactory", "Match");
-
-        assert!(content.contains("use crate::models::r#match::Match;"));
-        assert!(content.contains("let mut record = Self::definition();"));
-        assert!(!content.contains("let mut match"), "{content}");
-    }
-
-    #[test]
-    fn factory_output_dir_overrides_the_configured_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("custom").to_string_lossy().into_owned();
-
-        let mut config = TideConfig::default();
-        config.paths.factories = dir.path().join("configured").to_string_lossy().into_owned();
-
-        let path = FactoryGenerator::new(&config)
-            .output_dir(Some(&output))
-            .generate("Demo", None)
-            .unwrap();
-
-        assert!(path.starts_with(&output), "{}", path);
-    }
-}
+#[path = "../../tests/unit/generators_factory_tests.rs"]
+mod tests;

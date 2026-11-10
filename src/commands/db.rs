@@ -1,48 +1,15 @@
 //! Database commands for TideORM CLI
 
 use crate::DbCommands;
+use crate::commands::migrate::MigrateRunner;
+use crate::commands::runner::{Role, Runner};
 use crate::config::TideConfig;
 use crate::runtime_db;
-use crate::utils::{
-    confirm_destructive, package_name, print_info, print_success, print_warning, to_snake_case,
-};
+use crate::utils::{confirm_destructive, print_info, print_success, print_warning, to_snake_case};
 use colored::Colorize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// The binary target `tideorm db seed` runs; seeders are project code, so only
-/// the project itself can run them. It is named after the package, so two
-/// projects installed with `cargo install` do not collide on it.
-pub(crate) fn seed_runner_bin(package: &str) -> String {
-    format!("{package}-seed")
-}
-
-/// Where `tideorm init` scaffolds that binary, relative to the project root.
-pub(crate) fn seed_runner_path(package: &str) -> String {
-    format!("src/bin/{}.rs", seed_runner_bin(package))
-}
-
-/// How to add the runner to a project `tideorm init` did not scaffold.
-pub(crate) const SEED_RUNNER_SETUP_HINT: &str = "`tideorm db seed` runs your seeders through src/bin/<package>-seed.rs, a binary named after your package that connects TideORM and runs `seeders::all()`. Projects created by `tideorm init` include it; see \"Seeding\" in the tideorm-cli README to add it to this one.";
-
-/// A project's seeder runner, once it is known to build.
-pub(crate) struct SeedRunner {
-    manifest: PathBuf,
-    bin: String,
-}
-
-impl SeedRunner {
-    /// `cargo run` of the runner, before its own arguments. `--manifest-path`
-    /// keeps the working directory, so a relative SQLite path means the same
-    /// file to the runner as to the rest of this CLI.
-    fn command(&self) -> std::process::Command {
-        let mut command = std::process::Command::new("cargo");
-        command
-            .args(["run", "--quiet", "--manifest-path"])
-            .arg(&self.manifest)
-            .args(["--bin", self.bin.as_str(), "--"]);
-        command
-    }
-
+impl Runner {
     /// The registered seed `name` refers to: `name` snake-cased, or with
     /// `_seeder` added, which is how `make seeder` names what it generates
     /// (`User` finds `user_seeder`). The runner lists its seeds without
@@ -71,7 +38,7 @@ impl SeedRunner {
     }
 }
 
-/// The seed of `seeds` that `name` refers to; see [`SeedRunner::resolve_seed`].
+/// The seed of `seeds` that `name` refers to; see [`Runner::resolve_seed`].
 fn pick_seed(seeds: &[&str], name: &str) -> Result<String, String> {
     let snake = to_snake_case(name);
     let suffixed = format!("{snake}_seeder");
@@ -120,11 +87,9 @@ pub async fn seed(
 ) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    if config.is_production() && !force {
-        return Err("Cannot run seeders in production without --force flag".to_string());
-    }
+    config.guard_production(force, "run seeders")?;
 
-    let runner = ensure_seeding_supported(config_path)?;
+    let runner = Runner::build(config_path, Role::Seed)?;
     let seed = seeder
         .as_deref()
         .map(|name| runner.resolve_seed(name))
@@ -163,14 +128,12 @@ pub async fn seed(
 async fn fresh(config_path: &str, force: bool, verbose: bool) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    if config.is_production() && !force {
-        return Err("Cannot run db:fresh in production without --force flag".to_string());
-    }
+    config.guard_production(force, "run db:fresh")?;
 
     // db:fresh always re-seeds, so a project that cannot seed is refused here
     // instead of dropping every table and only then aborting on the seeding
     // step, which would leave it with an empty, unseeded database.
-    ensure_seeding_supported(config_path).map_err(|reason| {
+    Runner::build(config_path, Role::Seed).map_err(|reason| {
         format!(
             "{} Run `tideorm migrate fresh --force` if you only need to drop tables and re-run migrations.",
             reason
@@ -258,26 +221,25 @@ async fn status(config_path: &str, verbose: bool) -> Result<(), String> {
     connection_result
 }
 
-/// Initialize TideORM metadata tables for the current database
+/// Create the migrations ledger through the project's migration runner,
+/// whose `Migrator` creates it when it reads the migrations' status. The
+/// seed ledger is created when seeders first run.
 async fn check(config_path: &str, verbose: bool) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
     if verbose {
-        print_info("Initializing TideORM metadata tables...");
+        print_info("Creating the migrations ledger...");
     }
 
-    runtime_db::ensure_metadata_tables(&config, &config.migration.table).await?;
+    let registered = MigrateRunner::build(config_path, &config)?.status()?.len();
 
     println!("\n{}", "Database Metadata:".cyan().bold());
     println!("{}", "─".repeat(50));
     println!("  Migration table: {}", config.migration.table.green());
-    println!(
-        "  Seeder table:    {}",
-        runtime_db::DEFAULT_SEEDERS_TABLE.green()
-    );
+    println!("  Migrations:      {} registered", registered);
     println!("{}", "─".repeat(50));
 
-    print_success("TideORM metadata tables are ready");
+    print_success("The migrations ledger is ready");
     Ok(())
 }
 
@@ -312,9 +274,7 @@ async fn drop_database(
 ) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    if config.is_production() && !force {
-        return Err("Cannot drop database in production without --force flag".to_string());
-    }
+    config.guard_production(force, "drop database")?;
 
     let db_name = resolve_target_database(&config, name.as_deref())?;
 
@@ -353,9 +313,7 @@ async fn wipe(
 ) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
-    if config.is_production() && !force {
-        return Err("Cannot wipe database in production without --force flag".to_string());
-    }
+    config.guard_production(force, "wipe database")?;
 
     if drop_types && !drop_types_supported(&config) {
         print_warning(&format!(
@@ -390,7 +348,8 @@ async fn show_table(config_path: &str, table_name: &str, verbose: bool) -> Resul
         print_info(&format!("Getting info for table: {}", table_name));
     }
 
-    let columns = runtime_db::table_columns(&config, table_name).await?;
+    let db = runtime_db::connect(&config).await?;
+    let columns = runtime_db::table_columns(&db, table_name).await?;
 
     println!("\n{}", format!("Table: {}", table_name).cyan().bold());
     println!("{}", "─".repeat(80));
@@ -406,7 +365,7 @@ async fn show_table(config_path: &str, table_name: &str, verbose: bool) -> Resul
             col.name,
             col.data_type,
             if col.nullable { "YES" } else { "NO" },
-            col.key.as_deref().unwrap_or(""),
+            runtime_db::column_key(col),
             col.default.as_deref().unwrap_or("NULL")
         );
     }
@@ -425,7 +384,8 @@ async fn list_tables(config_path: &str, verbose: bool) -> Result<(), String> {
         print_info("Listing all tables...");
     }
 
-    let tables = runtime_db::list_tables(&config).await?;
+    let db = runtime_db::connect(&config).await?;
+    let tables = runtime_db::list_tables(&db).await?;
 
     println!("\n{}", "Database Tables:".cyan().bold());
     println!("{}", "─".repeat(50));
@@ -448,46 +408,6 @@ async fn list_tables(config_path: &str, verbose: bool) -> Result<(), String> {
 // =============================================================================
 // HELPER TYPES AND FUNCTIONS
 // =============================================================================
-
-/// The project's seeder runner, once it is known to build.
-///
-/// Commands that seed after a destructive step check this first, so a project
-/// without a runner is refused before its tables are dropped.
-pub(crate) fn ensure_seeding_supported(config_path: &str) -> Result<SeedRunner, String> {
-    let root = Path::new(config_path)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let manifest = root.join("Cargo.toml");
-    let package = package_name(&manifest)
-        .map_err(|reason| format!("No seeder runner: {}. {}", reason, SEED_RUNNER_SETUP_HINT))?;
-
-    let runner_path = root.join(seed_runner_path(&package));
-    if !runner_path.is_file() {
-        return Err(format!(
-            "No seeder runner at {}. {}",
-            runner_path.display(),
-            SEED_RUNNER_SETUP_HINT
-        ));
-    }
-
-    // Built before anything is dropped: a seeder that does not compile would
-    // otherwise only show once the tables were gone.
-    let bin = seed_runner_bin(&package);
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--quiet", "--manifest-path"])
-        .arg(&manifest)
-        .args(["--bin", bin.as_str()])
-        .status()
-        .map_err(|error| format!("Failed to run cargo: {}", error))?;
-    if !status.success() {
-        return Err(format!(
-            "The seeder runner does not build ({}); nothing was changed.",
-            status
-        ));
-    }
-    Ok(SeedRunner { manifest, bin })
-}
 
 /// Resolve the database a `db create` / `db drop` invocation should act on.
 ///
@@ -549,228 +469,5 @@ async fn wipe_tables(config: &TideConfig, drop_types: bool) -> Result<(), String
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{check, drop_types_supported, pick_seed, resolve_target_database};
-    use crate::config::TideConfig;
-    use crate::runtime_db;
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn a_seeder_is_found_by_its_own_name_or_its_model_name() {
-        let seeds = ["database_seeder", "user_seeder", "demo"];
-        assert_eq!(pick_seed(&seeds, "UserSeeder").unwrap(), "user_seeder");
-        assert_eq!(pick_seed(&seeds, "user_seeder").unwrap(), "user_seeder");
-        assert_eq!(pick_seed(&seeds, "User").unwrap(), "user_seeder");
-        // A seed named exactly so wins over one with `_seeder` added.
-        assert_eq!(pick_seed(&seeds, "Demo").unwrap(), "demo");
-
-        let unknown = pick_seed(&seeds, "Nope").unwrap_err();
-        assert!(unknown.contains("No seeder named `Nope`"), "{unknown}");
-        assert!(
-            unknown.contains("database_seeder, user_seeder, demo"),
-            "{unknown}"
-        );
-        assert!(
-            pick_seed(&[], "User")
-                .unwrap_err()
-                .contains("registers none")
-        );
-    }
-
-    #[test]
-    fn an_explicit_empty_database_target_does_not_fall_back_to_config() {
-        let mut config = TideConfig::default();
-        config.database.database = Some("production".to_string());
-
-        let error = resolve_target_database(&config, Some("  "))
-            .expect_err("an explicitly empty target must not select the configured database");
-        assert!(error.contains("must not be empty"));
-    }
-
-    #[test]
-    fn drop_types_is_reported_as_postgres_only() {
-        let fixture = TempDbProject::new();
-        let mut config = TideConfig::load(fixture.config_path()).expect("config should load");
-
-        config.database.driver = "sqlite".to_string();
-        assert!(!drop_types_supported(&config));
-
-        config.database.driver = "mysql".to_string();
-        assert!(!drop_types_supported(&config));
-
-        config.database.driver = "postgres".to_string();
-        assert!(drop_types_supported(&config));
-
-        config.database.driver = "postgresql".to_string();
-        assert!(drop_types_supported(&config));
-    }
-
-    #[tokio::test]
-    async fn check_creates_metadata_tables_for_sqlite() {
-        let fixture = TempDbProject::new();
-
-        check(fixture.config_path(), false)
-            .await
-            .expect("check should initialize metadata tables");
-
-        let config = TideConfig::load(fixture.config_path()).expect("config should load");
-        let tables = runtime_db::list_tables(&config)
-            .await
-            .expect("tables should be listed");
-
-        assert!(tables.iter().any(|table| table == "_migrations"));
-        assert!(
-            tables
-                .iter()
-                .any(|table| table == runtime_db::DEFAULT_SEEDERS_TABLE)
-        );
-    }
-
-    #[tokio::test]
-    async fn status_returns_failure_when_sqlite_database_is_missing() {
-        let dir = TempDir::new().expect("temp dir should be created");
-        let database_path = dir.path().join("missing.sqlite3");
-        let config_path = dir.path().join("tideorm.toml");
-        let database_url = crate::config::sqlite_connection_url(
-            database_path
-                .to_str()
-                .expect("database path should be UTF-8"),
-        );
-        fs::write(
-            &config_path,
-            format!(
-                "[project]\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nurl = {:?}\n",
-                database_url
-            ),
-        )
-        .expect("config should be written");
-
-        assert!(
-            super::status(&slash_path(&config_path), false)
-                .await
-                .is_err()
-        );
-        assert!(!database_path.exists());
-    }
-
-    /// `a_parents` is dropped first, while `b_children` still points at it, so
-    /// the drops need the foreign-key switch of their own session.
-    #[tokio::test]
-    async fn wipe_drops_a_table_other_rows_still_reference() {
-        let fixture = TempDbProject::new();
-        let config = TideConfig::load(fixture.config_path()).expect("config should load");
-        let db = runtime_db::connect(&config).await.expect("connect");
-        for sql in [
-            "CREATE TABLE a_parents (id INTEGER PRIMARY KEY)",
-            "CREATE TABLE b_children (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES a_parents(id))",
-            "INSERT INTO a_parents (id) VALUES (1)",
-            "INSERT INTO b_children (id, parent_id) VALUES (1, 1)",
-        ] {
-            runtime_db::execute_on_db(&db, sql).await.expect(sql);
-        }
-
-        runtime_db::wipe_tables(&config, false)
-            .await
-            .expect("wipe should drop every table");
-
-        let tables = runtime_db::list_tables(&config)
-            .await
-            .expect("tables should be listed");
-        assert!(tables.is_empty(), "{tables:?}");
-    }
-
-    /// A view left behind made `migrate fresh` fail on its `CREATE VIEW` after
-    /// every table was already gone.
-    #[tokio::test]
-    async fn wipe_drops_views_too() {
-        let fixture = TempDbProject::new();
-        let config = TideConfig::load(fixture.config_path()).expect("config should load");
-        let db = runtime_db::connect(&config).await.expect("connect");
-        for sql in [
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
-            "CREATE VIEW user_names AS SELECT name FROM users",
-        ] {
-            runtime_db::execute_on_db(&db, sql).await.expect(sql);
-        }
-
-        runtime_db::wipe_tables(&config, false)
-            .await
-            .expect("wipe should drop every table and view");
-
-        let left = runtime_db::query_json(&config, "SELECT name FROM sqlite_master")
-            .await
-            .expect("schema should be readable");
-        assert!(left.is_empty(), "{left:?}");
-    }
-
-    /// `db drop` deletes the file the connection URL opens, not `sqlite_path`.
-    #[tokio::test]
-    async fn drop_deletes_the_file_the_connection_url_opens() {
-        let dir = TempDir::new().expect("temp dir should be created");
-        let root = dir.path();
-        let real = root.join("real.sqlite3");
-        let decoy = root.join("decoy.sqlite3");
-        fs::write(&real, b"").expect("real database should be created");
-        fs::write(&decoy, b"").expect("decoy should be created");
-
-        let config_path = root.join("tideorm.toml");
-        fs::write(
-            &config_path,
-            format!(
-                "[project]\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\nurl = \"${{TIDEORM_TEST_DROP_URL}}\"\n",
-                slash_path(&decoy)
-            ),
-        )
-        .expect("config should be written");
-        fs::write(
-            root.join(".env"),
-            format!(
-                "TIDEORM_TEST_DROP_URL=sqlite:{}?mode=rwc\n",
-                slash_path(&real)
-            ),
-        )
-        .expect("env file should be written");
-
-        super::drop_database(&slash_path(&config_path), None, true, false)
-            .await
-            .expect("drop should succeed");
-
-        assert!(!real.exists(), "the database the URL names must be dropped");
-        assert!(decoy.exists(), "sqlite_path is not the database in use");
-    }
-
-    struct TempDbProject {
-        _dir: TempDir,
-        config_path: String,
-    }
-
-    impl TempDbProject {
-        fn new() -> Self {
-            let dir = TempDir::new().expect("temp dir should be created");
-            let root = dir.path();
-            let db_path = slash_path(root.join("check.sqlite3"));
-            let config_path = root.join("tideorm.toml");
-
-            let config_contents = format!(
-                "[project]\nname = \"test-project\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{}\"\n\n[paths]\nmigrations = \"src/migrations\"\nmodels = \"src/models\"\nseeders = \"src/seeders\"\nfactories = \"src/factories\"\nconfig_file = \"src/config.rs\"\n\n[migration]\ntable = \"_migrations\"\ntimestamps = true\n\n[model]\ntimestamps = true\nsoft_deletes = false\ntokenize = false\nprimary_key = \"id\"\nprimary_key_type = \"i64\"\n",
-                db_path,
-            );
-
-            fs::write(&config_path, config_contents).expect("config should be written");
-
-            Self {
-                _dir: dir,
-                config_path: slash_path(config_path),
-            }
-        }
-
-        fn config_path(&self) -> &str {
-            &self.config_path
-        }
-    }
-
-    fn slash_path(path: impl AsRef<std::path::Path>) -> String {
-        path.as_ref().to_string_lossy().replace('\\', "/")
-    }
-}
+#[path = "../../tests/unit/commands_db_tests.rs"]
+mod tests;

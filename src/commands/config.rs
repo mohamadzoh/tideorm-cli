@@ -56,16 +56,12 @@ pub async fn show(config_path: &str, verbose: bool) -> Result<(), String> {
         println!("  url = \"{}\"", mask_url_credentials(url));
     }
 
-    println!("  pool_size = {}", config.database.pool_size);
-    println!("  timeout = {}", config.database.timeout);
-
     // Paths
     println!("\n{}", "[paths]".yellow());
     println!("  models = \"{}\"", config.paths.models);
     println!("  migrations = \"{}\"", config.paths.migrations);
     println!("  seeders = \"{}\"", config.paths.seeders);
     println!("  factories = \"{}\"", config.paths.factories);
-    println!("  config_file = \"{}\"", config.paths.config_file);
 
     // Migration
     println!("\n{}", "[migration]".yellow());

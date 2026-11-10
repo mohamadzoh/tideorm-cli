@@ -6,7 +6,7 @@ use crate::generators::{
     factory::FactoryGenerator, migration::MigrationGenerator, model::ModelGenerator,
     seeder::SeederGenerator,
 };
-use crate::utils::{RelationDefinition, RelationType};
+use crate::utils::{RelationDefinition, RelationType, split_definitions};
 use crate::utils::{print_info, print_success};
 
 /// Handle make subcommands
@@ -179,56 +179,58 @@ async fn make_model(
         .tokenize(tokenize)
         .output_dir(&output_dir);
 
-    // Generate model file
-    let model_path = generator.generate()?;
-    print_success(&format!("Created model: {}", model_path));
+    let migration_gen = MigrationGenerator::new(&config);
+    let seeder_gen = SeederGenerator::new(&config);
+    let factory_gen = FactoryGenerator::new(&config);
+    let seed_fields = generator.seed_fields();
 
-    // Generate migration if requested
+    // Check and render every requested file before writing any, so a failure leaves
+    // nothing half generated.
+    let mut files = vec![("model", generator.render()?)];
+
     if create_migration {
         if verbose {
             print_info("Generating migration for model...");
         }
-
-        let migration_gen = MigrationGenerator::new(&config);
         let migration_name = format!("create_{}_table", table_name);
-        let migration_path = migration_gen.generate(
-            &migration_name,
-            Some(table_name),
-            None,
-            fields_for_migration,
-            timestamps,
-            soft_deletes,
-        )?;
-        print_success(&format!("Created migration: {}", migration_path));
+        files.push((
+            "migration",
+            migration_gen.render(
+                &migration_name,
+                Some(table_name),
+                None,
+                fields_for_migration,
+                timestamps,
+                soft_deletes,
+            )?,
+        ));
     }
 
-    // Generate seeder if requested
     if create_seeder {
         if verbose {
             print_info("Generating seeder for model...");
         }
-
-        let seeder_gen = SeederGenerator::new(&config);
         let seeder_name = format!("{}Seeder", name);
-        let seeder_path = seeder_gen.generate_with_fields(
-            &seeder_name,
-            Some(name.to_string()),
-            10,
-            &generator.seed_fields(),
-        )?;
-        print_success(&format!("Created seeder: {}", seeder_path));
+        files.push((
+            "seeder",
+            seeder_gen.render(&seeder_name, Some(name.to_string()), 10, &seed_fields)?,
+        ));
     }
 
-    // Generate factory if requested
     if create_factory {
         if verbose {
             print_info("Generating factory for model...");
         }
-
-        let factory_gen = FactoryGenerator::new(&config);
         let factory_name = format!("{}Factory", name);
-        let factory_path = factory_gen.generate(&factory_name, Some(name.to_string()))?;
-        print_success(&format!("Created factory: {}", factory_path));
+        files.push((
+            "factory",
+            factory_gen.render(&factory_name, Some(name.to_string()))?,
+        ));
+    }
+
+    for (kind, file) in files {
+        let path = file.write()?;
+        print_success(&format!("Created {}: {}", kind, path));
     }
 
     Ok(())
@@ -328,14 +330,17 @@ fn resolve_table_name(model_name: &str, table: Option<&str>) -> String {
 /// model is generated for: a nullable field left `NOT NULL` fails the first
 /// insert that leaves it empty.
 fn with_listed_modifiers(fields: &str, lists: &[(&str, Option<&str>)]) -> String {
-    fields
-        .split(',')
+    split_definitions(fields, ',')
+        .into_iter()
         .map(|field| {
             let name = field.split(':').next().unwrap_or_default().trim();
             let mut field = field.to_string();
             for (modifier, list) in lists {
                 let listed = list.is_some_and(|names| names.split(',').any(|n| n.trim() == name));
-                let present = field.split(':').skip(2).any(|m| m.trim() == *modifier);
+                let present = split_definitions(&field, ':')
+                    .iter()
+                    .skip(2)
+                    .any(|m| m.trim() == *modifier);
                 if listed && !present {
                     field.push(':');
                     field.push_str(modifier);
@@ -358,8 +363,8 @@ fn prepare_model_migration_fields(
     let mut field_defs: Vec<String> = fields
         .as_deref()
         .map(|value| {
-            value
-                .split(',')
+            split_definitions(value, ',')
+                .into_iter()
                 .map(str::trim)
                 .filter(|field| !field.is_empty())
                 .map(ToOwned::to_owned)
@@ -432,260 +437,5 @@ fn prepare_model_migration_fields(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        make_factory, make_migration, make_model, make_seeder, output_override,
-        prepare_model_migration_fields, resolve_table_name,
-    };
-    use std::fs;
-    use std::path::Path;
-    use tempfile::TempDir;
-
-    #[test]
-    fn listed_modifiers_reach_the_migration_fields() {
-        assert_eq!(
-            super::with_listed_modifiers(
-                "title:string,summary:text,email:string:unique",
-                &[
-                    ("nullable", Some("summary")),
-                    ("unique", Some("email, title")),
-                    ("indexed", None),
-                ],
-            ),
-            "title:string:unique,summary:text:nullable,email:string:unique"
-        );
-    }
-
-    #[test]
-    fn test_resolve_table_name_honours_explicit_override() {
-        assert_eq!(resolve_table_name("BlogPost", None), "blog_posts");
-        assert_eq!(resolve_table_name("User", Some("app_users")), "app_users");
-    }
-
-    #[test]
-    fn test_prepare_model_migration_fields_uses_configured_primary_key_type() {
-        let fields = prepare_model_migration_fields(
-            Some("title:string".to_string()),
-            Some("author:belongs_to:User"),
-            None,
-            None,
-            None,
-            "uuid",
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(fields.contains("title:string"));
-        assert!(fields.contains("user_id:uuid:indexed"));
-    }
-
-    #[test]
-    fn test_prepare_model_migration_fields_adds_translations_column() {
-        let fields = prepare_model_migration_fields(
-            Some("title:string".to_string()),
-            None,
-            Some("title"),
-            None,
-            None,
-            "i64",
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(fields.contains("title:string"));
-        assert!(fields.contains("translations:jsonb:nullable"));
-    }
-
-    #[test]
-    fn output_override_preserves_every_explicit_directory() {
-        assert_eq!(output_override(None), Ok(None));
-        assert_eq!(output_override(Some("src/models")), Ok(Some("src/models")));
-        assert_eq!(
-            output_override(Some(" db/seeders ")),
-            Ok(Some(" db/seeders "))
-        );
-        assert_eq!(
-            output_override(Some("")),
-            Err("--output requires a non-empty directory".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn make_migration_writes_to_the_output_directory() {
-        let output = temp_output();
-
-        make_migration(
-            MISSING_CONFIG,
-            "create_users_table",
-            Some("users".to_string()),
-            None,
-            None,
-            Some(output.path()),
-            false,
-        )
-        .await
-        .expect("migration should be generated");
-
-        assert!(output.contains_file_matching("_create_users_table.rs"));
-        assert!(Path::new(&format!("{}/mod.rs", output.path())).exists());
-    }
-
-    #[tokio::test]
-    async fn make_seeder_writes_to_the_output_directory() {
-        let output = temp_output();
-
-        make_seeder(
-            MISSING_CONFIG,
-            "UserSeeder",
-            Some("User".to_string()),
-            5,
-            Some(output.path()),
-            false,
-        )
-        .await
-        .expect("seeder should be generated");
-
-        let content = fs::read_to_string(format!("{}/user_seeder.rs", output.path()))
-            .expect("seeder should be written to --output");
-        // Moving the file must not move the model: the import still follows
-        // `[paths] models`.
-        assert!(
-            content.contains("use crate::models::user::User;"),
-            "{}",
-            content
-        );
-    }
-
-    #[tokio::test]
-    async fn make_factory_writes_to_the_output_directory() {
-        let output = temp_output();
-
-        make_factory(
-            MISSING_CONFIG,
-            "UserFactory",
-            Some("User".to_string()),
-            Some(output.path()),
-            false,
-        )
-        .await
-        .expect("factory should be generated");
-
-        let content = fs::read_to_string(format!("{}/user_factory.rs", output.path()))
-            .expect("factory should be written to --output");
-        assert!(
-            content.contains("use crate::models::user::User;"),
-            "{}",
-            content
-        );
-    }
-
-    #[tokio::test]
-    async fn make_model_output_also_moves_the_companion_seeder_import() {
-        let project = TestProject::new();
-        let model_output = project.path("src/domain/models");
-
-        make_model(
-            project.config_path(),
-            "User",
-            None,
-            Some("name:string".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(model_output.as_str()),
-            false,
-            true,
-            false,
-            false,
-        )
-        .await
-        .expect("model and seeder should be generated");
-
-        assert!(Path::new(&format!("{}/user.rs", model_output)).exists());
-
-        let seeder = fs::read_to_string(format!("{}/user_seeder.rs", project.path("src/seeders")))
-            .expect("seeder should be written to the configured seeders directory");
-        // The configured paths are absolute here, so only the tail of the module path is
-        // meaningful - what matters is that it follows the relocated model.
-        assert!(seeder.contains("domain::models::user::User"), "{}", seeder);
-    }
-
-    /// A config path that does not exist, so the built-in defaults apply.
-    const MISSING_CONFIG: &str = "tideorm.toml.does-not-exist";
-
-    /// A throwaway directory to hand to `--output`.
-    struct Output {
-        _dir: TempDir,
-        path: String,
-    }
-
-    impl Output {
-        fn path(&self) -> &str {
-            &self.path
-        }
-
-        fn contains_file_matching(&self, suffix: &str) -> bool {
-            fs::read_dir(&self.path)
-                .expect("output directory should exist")
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().ends_with(suffix))
-        }
-    }
-
-    fn temp_output() -> Output {
-        let dir = TempDir::new().expect("temp dir should be created");
-        let path = slash_path(dir.path().join("generated"));
-        Output { _dir: dir, path }
-    }
-
-    /// A project whose `tideorm.toml` keeps every generated file inside a temp directory.
-    struct TestProject {
-        _dir: TempDir,
-        root: std::path::PathBuf,
-        config_path: String,
-    }
-
-    impl TestProject {
-        fn new() -> Self {
-            let dir = TempDir::new().expect("temp dir should be created");
-            let root = dir.path().to_path_buf();
-            let config_path = root.join("tideorm.toml");
-
-            let contents = format!(
-                "[project]\nname = \"demo\"\nenvironment = \"development\"\n\n[database]\ndriver = \"sqlite\"\nsqlite_path = \"{database}\"\n\n[paths]\nmodels = \"{models}\"\nmigrations = \"{migrations}\"\nseeders = \"{seeders}\"\nfactories = \"{factories}\"\nconfig_file = \"{config_file}\"\n",
-                database = slash_path(root.join("app.db")),
-                models = slash_path(root.join("src").join("models")),
-                migrations = slash_path(root.join("src").join("migrations")),
-                seeders = slash_path(root.join("src").join("seeders")),
-                factories = slash_path(root.join("src").join("factories")),
-                config_file = slash_path(root.join("src").join("config.rs")),
-            );
-            fs::write(&config_path, contents).expect("config should be written");
-
-            Self {
-                _dir: dir,
-                root,
-                config_path: slash_path(&config_path),
-            }
-        }
-
-        fn config_path(&self) -> &str {
-            &self.config_path
-        }
-
-        fn path(&self, relative: &str) -> String {
-            slash_path(self.root.join(relative))
-        }
-    }
-
-    fn slash_path(path: impl AsRef<Path>) -> String {
-        path.as_ref().to_string_lossy().replace('\\', "/")
-    }
-}
+#[path = "../../tests/unit/commands_make_tests.rs"]
+mod tests;

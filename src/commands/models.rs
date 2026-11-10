@@ -1,7 +1,7 @@
 //! Models command for TideORM CLI
 
 use crate::config::TideConfig;
-use crate::utils::print_info;
+use crate::utils::{print_info, print_warning};
 use colored::Colorize;
 use std::fs;
 use std::path::Path;
@@ -105,55 +105,71 @@ struct ModelInfo {
     has_tokenize: bool,
 }
 
-/// Scan models directory and extract model information
+/// Scan the models directory and its subdirectories for model definitions
 fn scan_models(models_path: &str) -> Result<Vec<ModelInfo>, String> {
-    let path = Path::new(models_path);
     let mut models = Vec::new();
-
-    for entry in
-        fs::read_dir(path).map_err(|e| format!("Failed to read models directory: {}", e))?
-    {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let file_path = entry.path();
-
-        if file_path.extension().is_some_and(|ext| ext == "rs") {
-            let name = file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            if name == "mod" {
-                continue;
-            }
-
-            let content = fs::read_to_string(&file_path)
-                .map_err(|e| format!("Failed to read model file: {}", e))?;
-
-            if let Some(model_info) = parse_model_file(&content) {
-                models.push(model_info);
-            }
-        }
-    }
-
+    scan_directory(Path::new(models_path), &mut models)?;
     models.sort_by(|a, b| a.name.cmp(&b.name));
-
     Ok(models)
 }
 
-/// Parse a model file to extract information
-fn parse_model_file(content: &str) -> Option<ModelInfo> {
-    let syntax = syn::parse_file(content).ok()?;
-    let model = syntax.items.iter().find_map(|item| {
-        let syn::Item::Struct(item) = item else {
-            return None;
-        };
-        if !matches!(&item.vis, syn::Visibility::Public(_)) || !is_model(&item.attrs) {
-            return None;
-        }
-        Some(item)
-    })?;
+/// Collect the models of every `.rs` file under `path`; a file that is not valid Rust is
+/// reported and skipped.
+fn scan_directory(path: &Path, models: &mut Vec<ModelInfo>) -> Result<(), String> {
+    let entries = fs::read_dir(path)
+        .map_err(|e| format!("Failed to read models directory {}: {}", path.display(), e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let file_path = entry.path();
+        // `file_type` does not follow symlinks, so a link cycle cannot recurse forever.
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to read {}: {}", file_path.display(), e))?;
 
+        if file_type.is_dir() {
+            scan_directory(&file_path, models)?;
+        } else if file_path.extension().is_some_and(|ext| ext == "rs") {
+            let content = fs::read_to_string(&file_path)
+                .map_err(|e| format!("Failed to read model file {}: {}", file_path.display(), e))?;
+            match parse_model_file(&content) {
+                Ok(found) => models.extend(found),
+                Err(error) => print_warning(&format!(
+                    "Skipping {}: it is not valid Rust ({})",
+                    file_path.display(),
+                    error
+                )),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a source file and return every model it defines, inline modules included
+fn parse_model_file(content: &str) -> Result<Vec<ModelInfo>, syn::Error> {
+    let syntax = syn::parse_file(content)?;
+    let mut models = Vec::new();
+    collect_models(&syntax.items, &mut models);
+    Ok(models)
+}
+
+fn collect_models(items: &[syn::Item], models: &mut Vec<ModelInfo>) {
+    for item in items {
+        match item {
+            syn::Item::Struct(item)
+                if matches!(&item.vis, syn::Visibility::Public(_)) && is_model(&item.attrs) =>
+            {
+                models.extend(model_info(item));
+            }
+            syn::Item::Mod(syn::ItemMod {
+                content: Some((_, items)),
+                ..
+            }) => collect_models(items, models),
+            _ => {}
+        }
+    }
+}
+
+fn model_info(model: &syn::ItemStruct) -> Option<ModelInfo> {
     let struct_name = model.ident.to_string();
     let options = TideormOptions::of(&model.attrs);
     let table = options
@@ -177,12 +193,7 @@ fn parse_model_file(content: &str) -> Option<ModelInfo> {
 
     let relations: Vec<String> = named_fields
         .iter()
-        .filter(|field| {
-            let options = TideormOptions::of(&field.attrs);
-            ["belongs_to", "has_one", "has_many"]
-                .iter()
-                .any(|relation| options.has(relation))
-        })
+        .filter(|field| is_relation(&field.ty))
         .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
         .collect();
 
@@ -198,11 +209,46 @@ fn parse_model_file(content: &str) -> Option<ModelInfo> {
     })
 }
 
-/// Whether `path` is `tideorm::model`.
+/// Whether a field's type is one of TideORM's relation wrappers, seen through `Option`,
+/// `Box`, `Rc` and `Arc`: the wrapper, not an attribute, decides that a field is a relation.
+fn is_relation(ty: &syn::Type) -> bool {
+    const WRAPPERS: [&str; 9] = [
+        "HasOne",
+        "HasMany",
+        "BelongsTo",
+        "HasManyThrough",
+        "MorphOne",
+        "MorphMany",
+        "MorphTo",
+        "SelfRef",
+        "SelfRefMany",
+    ];
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    if ["Option", "Box", "Rc", "Arc"]
+        .iter()
+        .any(|outer| segment.ident == outer)
+    {
+        let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+            return false;
+        };
+        return arguments.args.iter().any(
+            |argument| matches!(argument, syn::GenericArgument::Type(inner) if is_relation(inner)),
+        );
+    }
+    WRAPPERS.iter().any(|wrapper| segment.ident == wrapper)
+}
+
+/// Whether `path` is `tideorm::model`, or `model` as the prelude imports it.
 fn is_model_attribute(path: &syn::Path) -> bool {
-    path.segments.len() == 2
-        && path.segments[0].ident == "tideorm"
-        && path.segments[1].ident == "model"
+    path.is_ident("model")
+        || (path.segments.len() == 2
+            && path.segments[0].ident == "tideorm"
+            && path.segments[1].ident == "model")
 }
 
 fn is_model(attributes: &[syn::Attribute]) -> bool {
@@ -267,88 +313,5 @@ impl TideormOptions {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::parse_model_file;
-
-    #[test]
-    fn test_parse_tideorm_model_attribute() {
-        let content = r#"
-#[tideorm::model(table = "posts")]
-#[index("user_id")]
-pub struct Post {
-    pub id: i64,
-    pub user_id: i64,
-    pub title: String,
-}
-"#;
-
-        let model = parse_model_file(content).expect("model should parse");
-        assert_eq!(model.name, "Post");
-        assert_eq!(model.table, "posts");
-        assert_eq!(model.fields.len(), 3);
-    }
-
-    #[test]
-    fn test_parse_only_reads_the_annotated_model_struct() {
-        let content = r#"
-#[tideorm::model(table = "posts")]
-pub struct Post {
-    pub id: i64,
-    pub title: String,
-    // pub commented_out: String,
-}
-
-#[tideorm::model(table = "helpers", soft_delete, translatable = "name", tokenize)]
-pub struct Helper {
-    pub created_at: String,
-    pub updated_at: String,
-    pub deleted_at: String,
-    pub other: String,
-}
-
-impl Post {
-    pub fn tokenize(&self) {}
-}
-"#;
-
-        let model = parse_model_file(content).expect("model should parse");
-        assert_eq!(model.name, "Post");
-        assert_eq!(model.table, "posts");
-        assert_eq!(model.fields, ["id", "title"]);
-        assert!(!model.has_timestamps);
-        assert!(!model.has_soft_deletes);
-        assert!(!model.has_tokenize);
-    }
-
-    #[test]
-    fn test_attachment_attribute_is_not_reported_as_a_relation() {
-        let content = r#"
-#[tideorm::model(table = "posts", has_many_files = "photos", translatable = "title", tokenize)]
-pub struct Post {
-    pub id: i64,
-    #[tideorm(belongs_to = "User", foreign_key = "user_id")]
-    pub user: BelongsTo<User>,
-}
-"#;
-
-        let model = parse_model_file(content).expect("model should parse");
-        assert_eq!(model.relations, ["user"]);
-        assert!(model.has_translatable);
-        assert!(model.has_tokenize);
-    }
-
-    #[test]
-    fn test_parse_derived_model() {
-        let content = r#"
-#[derive(Clone, Model)]
-pub struct User {
-    pub id: i64,
-}
-"#;
-
-        let model = parse_model_file(content).expect("derived model should parse");
-        assert_eq!(model.name, "User");
-        assert_eq!(model.table, "users");
-        assert_eq!(model.fields, ["id"]);
-    }
-}
+#[path = "../../tests/unit/commands_models_tests.rs"]
+mod tests;

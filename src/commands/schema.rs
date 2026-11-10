@@ -4,6 +4,7 @@ use crate::config::TideConfig;
 use crate::runtime_db;
 use crate::utils::print_info;
 use colored::Colorize;
+use tideorm::prelude::Database;
 
 /// Show schema information
 pub async fn show(config_path: &str, table: Option<String>, verbose: bool) -> Result<(), String> {
@@ -13,16 +14,17 @@ pub async fn show(config_path: &str, table: Option<String>, verbose: bool) -> Re
         print_info("Fetching schema information...");
     }
 
+    let db = runtime_db::connect(&config).await?;
     if let Some(table_name) = table {
-        show_table_schema(&config, &table_name).await
+        show_table_schema(&db, &table_name).await
     } else {
-        show_all_schemas(&config).await
+        show_all_schemas(&db).await
     }
 }
 
 /// Show schema for a specific table
-async fn show_table_schema(config: &TideConfig, table_name: &str) -> Result<(), String> {
-    let columns = runtime_db::table_columns(config, table_name).await?;
+async fn show_table_schema(db: &Database, table_name: &str) -> Result<(), String> {
+    let columns = runtime_db::table_columns(db, table_name).await?;
 
     println!(
         "\n{}",
@@ -43,7 +45,7 @@ async fn show_table_schema(config: &TideConfig, table_name: &str) -> Result<(), 
             col.name,
             col.data_type,
             if col.nullable { "YES" } else { "NO" },
-            col.key.as_deref().unwrap_or(""),
+            runtime_db::column_key(col),
             col.default.as_deref().unwrap_or("NULL"),
             col.extra.as_deref().unwrap_or("")
         );
@@ -52,7 +54,7 @@ async fn show_table_schema(config: &TideConfig, table_name: &str) -> Result<(), 
     println!("{}", "─".repeat(100));
 
     // Show indexes
-    let indexes = runtime_db::table_indexes(config, table_name).await?;
+    let indexes = runtime_db::table_indexes(db, table_name).await?;
     if !indexes.is_empty() {
         println!("\n{}", "Indexes:".yellow());
         for idx in &indexes {
@@ -66,7 +68,7 @@ async fn show_table_schema(config: &TideConfig, table_name: &str) -> Result<(), 
     }
 
     // Show foreign keys
-    let foreign_keys = runtime_db::table_foreign_keys(config, table_name).await?;
+    let foreign_keys = runtime_db::table_foreign_keys(db, table_name).await?;
     if !foreign_keys.is_empty() {
         println!("\n{}", "Foreign Keys:".yellow());
         for fk in &foreign_keys {
@@ -83,8 +85,8 @@ async fn show_table_schema(config: &TideConfig, table_name: &str) -> Result<(), 
 }
 
 /// Show all table schemas
-async fn show_all_schemas(config: &TideConfig) -> Result<(), String> {
-    let tables = runtime_db::list_tables(config).await?;
+async fn show_all_schemas(db: &Database) -> Result<(), String> {
+    let tables = runtime_db::list_tables(db).await?;
 
     println!("\n{}", "Database Schema:".cyan().bold());
     println!("{}", "═".repeat(80));
@@ -95,15 +97,15 @@ async fn show_all_schemas(config: &TideConfig) -> Result<(), String> {
     }
 
     for table in &tables {
-        let columns = runtime_db::table_columns(config, table).await?;
+        let columns = runtime_db::table_columns(db, table).await?;
 
         println!("\n  {} ({})", table.green().bold(), columns.len());
 
         for col in &columns {
-            let key_marker = match col.key.as_deref() {
-                Some("PRI") => " 🔑",
-                Some("UNI") => " ⚡",
-                Some("MUL") | Some("FK") => " 🔗",
+            let key_marker = match runtime_db::column_key(col) {
+                "PRI" => " 🔑",
+                "UNI" => " ⚡",
+                "FK" => " 🔗",
                 _ => "",
             };
 

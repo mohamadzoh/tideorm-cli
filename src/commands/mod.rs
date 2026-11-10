@@ -6,4 +6,5 @@ pub mod init;
 pub mod make;
 pub mod migrate;
 pub mod models;
+pub(crate) mod runner;
 pub mod schema;

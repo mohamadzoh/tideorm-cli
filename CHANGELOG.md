@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.12.0
+
+- Builds on TideORM `0.17.0`, and new projects pin it through `SCAFFOLD_TIDEORM_VERSION`. Publish
+  this version only after `tideorm` 0.17.0 is on crates.io, or `tideorm init` scaffolds a
+  dependency that does not resolve.
+- `tideorm migrate` runs the project's own `<package>-migrate` binary over the
+  `migrations::all()` registry in `src/migrations/mod.rs`; `make migration` registers new
+  migrations there, and generated migrations are `Schema` builder code. `run --path` is gone.
+- The migrate and seed runners connect with `connect_only()`, and a failed migrate or seed batch
+  still reports what it ran before the failure.
+- `db` and `schema` commands read through `Database::catalog()` and the raw JSON API, connect
+  once per command, and parse connection URLs with the drivers' own options.
+- `refresh --step` is refused with `--seed`, and a missing SQLite file is refused outside
+  `db create` and `init`.
+- `tideorm models` scans subdirectories and every file, finds every public model and relation
+  wrapper, and reports files that do not parse.
+- `--fields` lists split only outside quotes and parentheses; `make model` checks every file
+  before writing any; `.env` values read dotenvy's escapes and an unknown escape is an error;
+  `mod.rs`, `.env` and `Cargo.toml` are replaced atomically; a migration number that needs more
+  digits than the migrations before it is an error.
+- The unused `pool_size`, `timeout` and `config_file` keys, `get_cli_config` and the features
+  table are removed.
+
 ## 0.11.1
 
 - Track TideORM `0.16.2`, a performance and maintenance release with no API changes. The CLI
