@@ -171,6 +171,14 @@ async fn status(config_path: &str, verbose: bool) -> Result<(), String> {
     println!("{}", "─".repeat(50));
 
     println!("  Driver:     {}", config.database.driver.green());
+    println!(
+        "  URL from:   {}",
+        config
+            .database
+            .url_source
+            .as_deref()
+            .unwrap_or("the [database] settings in tideorm.toml")
+    );
 
     match config.database.driver.as_str() {
         "sqlite" => match config.database.sqlite_file() {

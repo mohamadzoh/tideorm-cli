@@ -125,6 +125,39 @@ url = "${DATABASE_URL}"
 }
 
 #[test]
+fn the_url_names_where_it_came_from() {
+    let fixture = TempDir::new().unwrap();
+    let config_path = fixture.path().join("tideorm.toml");
+    let load = |url: &str| {
+        fs::write(
+            &config_path,
+            format!("[database]\ndriver = \"sqlite\"\n{url}"),
+        )
+        .unwrap();
+        TideConfig::load(config_path.to_str().unwrap())
+            .unwrap()
+            .database
+            .url_source
+    };
+    fs::write(
+        fixture.path().join(".env"),
+        "TIDEORM_TEST_SOURCE_URL=sqlite://from_env.db\nTIDEORM_TEST_SOURCE_FILE=part.db\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        load("url = \"${TIDEORM_TEST_SOURCE_URL}\"").as_deref(),
+        Some("TIDEORM_TEST_SOURCE_URL in the env file")
+    );
+    assert_eq!(
+        load("url = \"sqlite://${TIDEORM_TEST_SOURCE_FILE}\"").as_deref(),
+        Some("database.url in tideorm.toml")
+    );
+    assert_eq!(load("url = \"${TIDEORM_TEST_UNSET_URL}\""), None);
+    assert_eq!(load("sqlite_path = \"app.db\""), None);
+}
+
+#[test]
 fn test_connection_url_percent_encodes_credentials() {
     let config = DatabaseConfig {
         driver: "postgres".to_string(),

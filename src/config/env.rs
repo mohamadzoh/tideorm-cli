@@ -73,6 +73,19 @@ pub(super) fn lookup_env(name: &str, env_values: &HashMap<String, String>) -> Op
         .or_else(|| env_values.get(name).cloned())
 }
 
+/// Which of the places [`lookup_env`] reads gave `name`'s value, and whether
+/// the process environment hides a different value in the env file.
+pub(super) fn env_source(name: &str, env_values: &HashMap<String, String>) -> Option<String> {
+    let file = env_values.get(name);
+    match std::env::var(name) {
+        Ok(value) if file.is_some_and(|file| *file != value) => Some(format!(
+            "{name} in the process environment, which overrides the env file's {name}"
+        )),
+        Ok(_) => Some(format!("{name} in the process environment")),
+        Err(_) => file.map(|_| format!("{name} in the env file")),
+    }
+}
+
 pub(super) fn load_env_file(
     config_dir: &Path,
     env_file_name: &str,

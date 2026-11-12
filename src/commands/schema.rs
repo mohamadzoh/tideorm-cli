@@ -96,8 +96,21 @@ async fn show_all_schemas(db: &Database) -> Result<(), String> {
         return Ok(());
     }
 
-    for table in &tables {
-        let columns = runtime_db::table_columns(db, table).await?;
+    // Read the tables' columns a few at a time; print them in the listed order.
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let reads: Vec<_> = tables
+        .iter()
+        .map(|table| {
+            let (db, table, permits) = (db.clone(), table.clone(), permits.clone());
+            tokio::spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                runtime_db::table_columns(&db, &table).await
+            })
+        })
+        .collect();
+
+    for (table, read) in tables.iter().zip(reads) {
+        let columns = read.await.map_err(|error| error.to_string())??;
 
         println!("\n  {} ({})", table.green().bold(), columns.len());
 

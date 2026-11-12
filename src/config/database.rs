@@ -1,7 +1,8 @@
 //! The `[database]` section of `tideorm.toml` and the connection URLs it resolves to.
 
 use super::env::{
-    expand_env_vars_with_sources, is_lone_placeholder, lookup_env, unresolved_placeholders,
+    env_source, expand_env_vars_with_sources, is_lone_placeholder, lookup_env,
+    unresolved_placeholders,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,6 +43,11 @@ pub struct DatabaseConfig {
     /// SQLite database path
     #[serde(default)]
     pub sqlite_path: Option<String>,
+
+    /// Where the connection URL came from, for `db status`; none when the
+    /// declarative settings make it.
+    #[serde(skip)]
+    pub url_source: Option<String>,
 }
 
 impl Default for DatabaseConfig {
@@ -55,6 +61,7 @@ impl Default for DatabaseConfig {
             password: None,
             url: None,
             sqlite_path: None,
+            url_source: None,
         }
     }
 }
@@ -197,12 +204,22 @@ impl DatabaseConfig {
                         unresolved.join(", ")
                     ));
                 } else {
+                    self.url_source = match unresolved_placeholders(value)[..] {
+                        [name] if is_lone_placeholder(value) => env_source(name, env_values),
+                        _ => Some("database.url in tideorm.toml".to_string()),
+                    };
                     Some(url)
                 }
             }
-            None => lookup_env("DATABASE_URL", env_values),
+            None => {
+                self.url_source = env_source("DATABASE_URL", env_values);
+                lookup_env("DATABASE_URL", env_values)
+            }
         }
         .filter(|url| !url.trim().is_empty());
+        if self.url.is_none() {
+            self.url_source = None;
+        }
 
         if let Some(url) = self.url.clone() {
             self.apply_connection_url(&url)?;

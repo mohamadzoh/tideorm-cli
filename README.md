@@ -131,6 +131,7 @@ tideorm migrate mark --migration=create_users_table --force    # Force run in pr
 
 # View migration status
 tideorm migrate status
+tideorm migrate status --check   # Exit with an error when a migration is pending (CI)
 tideorm migrate history
 tideorm migrate history --limit=25   # Default: 10, most recently applied first
 ```
@@ -254,7 +255,8 @@ tideorm db seed --force               # Force run in production
 tideorm db fresh
 tideorm db fresh --force  # Skip the confirmation prompt (required in production)
 
-# Show database connection status
+# Show database connection status, and where the connection URL came from
+# (the process environment, the env file or tideorm.toml)
 tideorm db status
 
 # Create the migrations ledger, through the migration runner

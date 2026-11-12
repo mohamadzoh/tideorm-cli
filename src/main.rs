@@ -259,7 +259,11 @@ enum MigrateCommands {
     },
 
     /// Show migration status
-    Status,
+    Status {
+        /// Exit with an error when a migration is pending, for CI
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Show migration history
     History {

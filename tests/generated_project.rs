@@ -357,9 +357,16 @@ fn generated_sqlite_project_runs_its_migrations() -> Result<(), Box<dyn std::err
         status.contains("Total: 2 | Ran: 0 | Pending: 2"),
         "{status}"
     );
+    tideorm()?
+        .current_dir(&project_dir)
+        .env("CARGO_NET_OFFLINE", "true")
+        .args(["migrate", "status", "--check"])
+        .assert()
+        .failure();
 
     let first = run(&["migrate", "run"])?;
     assert!(first.contains("Ran 2 migration(s) successfully"), "{first}");
+    run(&["migrate", "status", "--check"])?;
     let second = run(&["migrate", "run"])?;
     assert!(second.contains("Nothing to migrate"), "{second}");
 

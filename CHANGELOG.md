@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.1
+
+- Its lockfile builds on TideORM `0.17.4`, so `cargo install --locked` gets that release's fixes,
+  among them the masking of percent-encoded password keys in the URLs it prints.
+- `tideorm schema` reads the tables' columns four at a time instead of one after another, and
+  still prints them in the listed order.
+- `tideorm migrate status --check` exits with an error when a migration is pending, so a CI
+  step can refuse a deploy whose database is behind.
+- `tideorm db status` says where the connection URL came from: `DATABASE_URL` in the process
+  environment (and whether it hides a different one in the env file), in the env file, or
+  `database.url` in `tideorm.toml`.
+
 ## 0.12.0
 
 - Builds on TideORM `0.17.0`, and new projects pin it through `SCAFFOLD_TIDEORM_VERSION`. Publish

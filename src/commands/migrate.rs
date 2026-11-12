@@ -129,7 +129,7 @@ pub async fn handle_subcommand(
             unmark,
             force,
         } => migrate_mark(config_path, &migration, unmark, force, verbose),
-        MigrateCommands::Status => migration_status(config_path, verbose),
+        MigrateCommands::Status { check } => migration_status(config_path, check, verbose),
         MigrateCommands::History { limit } => migration_history(config_path, limit, verbose),
     }
 }
@@ -477,8 +477,8 @@ fn migrate_mark(
     Ok(())
 }
 
-/// Show migration status
-fn migration_status(config_path: &str, verbose: bool) -> Result<(), String> {
+/// Show migration status; with `check`, fail when any is pending.
+fn migration_status(config_path: &str, check: bool, verbose: bool) -> Result<(), String> {
     let config = TideConfig::load(config_path)?;
 
     if verbose {
@@ -507,13 +507,17 @@ fn migration_status(config_path: &str, verbose: bool) -> Result<(), String> {
     }
 
     println!("{}", "─".repeat(60));
+    let pending = migrations.len() - ran;
     println!(
         "  Total: {} | Ran: {} | Pending: {}",
         migrations.len(),
         ran,
-        migrations.len() - ran
+        pending
     );
 
+    if check && pending > 0 {
+        return Err(format!("{pending} migration(s) pending"));
+    }
     Ok(())
 }
 
