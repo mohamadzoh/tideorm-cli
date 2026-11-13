@@ -1,4 +1,8 @@
-use super::{parse_model_file, scan_models};
+use super::{ModelInfo, public_models, scan_models};
+
+fn parse_model_file(content: &str) -> Result<Vec<ModelInfo>, syn::Error> {
+    Ok(public_models(&syn::parse_file(content)?))
+}
 
 #[test]
 fn test_parse_tideorm_model_attribute() {

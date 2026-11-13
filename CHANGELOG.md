@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.2
+
+- Its lockfile builds on TideORM `0.17.5`.
+- `tideorm analyze` reads the project's code and, when it can connect, its database, and
+  reports filters and relation keys no index serves, queries and writes inside loops, raw SQL
+  built with `format!`, misspelt filter columns, model fields the table lacks or may hold NULL
+  for, and other common mistakes. `--offline` uses the indexes the migrations and models make.
+  It fails on an error, so CI can run it.
+- `tideorm models` names a table the way the derive does, with its own plural rules
+  (`S3Object` reads `s_3_objects`, `UserSettings` `user_settingses`).
+
 ## 0.12.1
 
 - Its lockfile builds on TideORM `0.17.4`, so `cargo install --locked` gets that release's fixes,

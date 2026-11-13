@@ -522,7 +522,41 @@ tideorm models
 # Show schema information
 tideorm schema
 tideorm schema --table=users
+
+# Find missing indexes, slow query patterns and common mistakes
+tideorm analyze
+tideorm analyze --offline   # without the database: use the indexes the migrations and models make
 ```
+
+`tideorm analyze` reads every `.rs` file under the project's `src/` and, when it can
+connect, the indexes and columns of the tables the models read; offline, it takes the
+indexes the migrations' `Schema` calls create and the models' `#[index]` attributes declare.
+Each `src/bin` program's models are its own. It reports:
+
+| Rule | Finds |
+|---|---|
+| `unknown-column` (error) | a `where_*` on a column the model does not have |
+| `missing-column` (error) | a model field whose column the table lacks |
+| `unindexed-filter` | a query whose filters no index can serve, so it reads every row |
+| `unindexed-foreign-key` | a `HasOne`/`HasMany`/`SelfRefMany`/`HasManyThrough` key no index leads |
+| `n-plus-one` | a query or relation `load()` awaited inside a loop |
+| `write-in-loop` | `save()`/`create()`/`delete()` awaited inside a loop, outside `seeders`/`factories` |
+| `sql-injection` | raw SQL (`where_raw`, `Database::raw_json`, ..) built with `format!` or `+` |
+| `rows-to-count` | `.get().await?.len()` or `.is_empty()` instead of `count()`/`exists()` |
+| `nullable-mismatch` | a nullable column read into a field that is not an `Option` |
+| `sensitive-field` | a password, secret or token field that is neither hidden nor encrypted |
+| `missing-table` | a model whose table the database lacks |
+| hints | `count() > 0` instead of `exists()`, unbounded reads, `LIKE '%..'`, unindexed `ORDER BY` and joins, indexes the primary key covers, money in floats |
+
+The command fails when it finds an error, so CI can run it. It reads the code without
+running it: a query built inside a macro (`vec![..]`, `join!(..)`) or passed between
+functions as anything but a `QueryBuilder<Model>` parameter is not followed. It stays
+quiet where it cannot be sure: a query a function takes or returns as a `QueryBuilder`
+is checked for misspelt columns only, since its caller adds the other filters; a query
+that calls a scope or a condition it cannot read (`where_raw`, `where_has`, `when(..)`)
+is not called unindexed; and a loop over pages (`page()`, `paginate()`, `chunk()`), or a
+`loop`/`while` that takes a `limit()`ed batch each time, is not N+1. When `tideorm.toml`
+cannot be read or the database cannot be reached, it says so and runs offline.
 
 ### Global Options
 

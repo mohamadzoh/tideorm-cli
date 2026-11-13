@@ -26,8 +26,10 @@
 // budget only, and nothing here recurses at runtime.
 #![recursion_limit = "256"]
 
+mod analyze;
 mod commands;
 mod config;
+mod derive_names;
 mod generators;
 mod runtime_db;
 mod utils;
@@ -99,6 +101,13 @@ enum Commands {
 
     /// List all models in the project
     Models,
+
+    /// Find missing indexes, slow query patterns and common mistakes in the project's code
+    Analyze {
+        /// Do not connect to the database: use the indexes the models declare
+        #[arg(long)]
+        offline: bool,
+    },
 
     /// Show schema information
     Schema {
@@ -546,6 +555,9 @@ async fn run() {
         }
         Commands::Config => commands::config::show(&cli.config, cli.verbose).await,
         Commands::Models => commands::models::list(&cli.config, cli.verbose).await,
+        Commands::Analyze { offline } => {
+            commands::analyze::run(&cli.config, offline, cli.verbose).await
+        }
         Commands::Schema { table } => commands::schema::show(&cli.config, table, cli.verbose).await,
     };
 

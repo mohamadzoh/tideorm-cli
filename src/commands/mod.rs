@@ -1,5 +1,6 @@
 //! Command modules for TideORM CLI
 
+pub mod analyze;
 pub mod config;
 pub mod db;
 pub mod init;

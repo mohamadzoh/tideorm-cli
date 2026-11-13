@@ -1,9 +1,8 @@
 //! Models command for TideORM CLI
 
 use crate::config::TideConfig;
-use crate::utils::{print_info, print_warning};
+use crate::utils::print_info;
 use colored::Colorize;
-use std::fs;
 use std::path::Path;
 
 /// List all models in the project
@@ -107,75 +106,43 @@ struct ModelInfo {
 
 /// Scan the models directory and its subdirectories for model definitions
 fn scan_models(models_path: &str) -> Result<Vec<ModelInfo>, String> {
-    let mut models = Vec::new();
-    scan_directory(Path::new(models_path), &mut models)?;
+    let mut models: Vec<ModelInfo> = super::analyze::read_sources(Path::new(models_path))?
+        .iter()
+        .flat_map(|file| public_models(&file.syntax))
+        .collect();
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(models)
 }
 
-/// Collect the models of every `.rs` file under `path`; a file that is not valid Rust is
-/// reported and skipped.
-fn scan_directory(path: &Path, models: &mut Vec<ModelInfo>) -> Result<(), String> {
-    let entries = fs::read_dir(path)
-        .map_err(|e| format!("Failed to read models directory {}: {}", path.display(), e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let file_path = entry.path();
-        // `file_type` does not follow symlinks, so a link cycle cannot recurse forever.
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Failed to read {}: {}", file_path.display(), e))?;
-
-        if file_type.is_dir() {
-            scan_directory(&file_path, models)?;
-        } else if file_path.extension().is_some_and(|ext| ext == "rs") {
-            let content = fs::read_to_string(&file_path)
-                .map_err(|e| format!("Failed to read model file {}: {}", file_path.display(), e))?;
-            match parse_model_file(&content) {
-                Ok(found) => models.extend(found),
-                Err(error) => print_warning(&format!(
-                    "Skipping {}: it is not valid Rust ({})",
-                    file_path.display(),
-                    error
-                )),
-            }
-        }
-    }
-    Ok(())
+/// The public models a source file declares, inline modules included.
+fn public_models(syntax: &syn::File) -> Vec<ModelInfo> {
+    model_structs(&syntax.items)
+        .into_iter()
+        .filter(|item| matches!(item.vis, syn::Visibility::Public(_)))
+        .filter_map(model_info)
+        .collect()
 }
 
-/// Parse a source file and return every model it defines, inline modules included
-fn parse_model_file(content: &str) -> Result<Vec<ModelInfo>, syn::Error> {
-    let syntax = syn::parse_file(content)?;
+/// Every model struct among `items`, inline modules included.
+pub(crate) fn model_structs(items: &[syn::Item]) -> Vec<&syn::ItemStruct> {
     let mut models = Vec::new();
-    collect_models(&syntax.items, &mut models);
-    Ok(models)
-}
-
-fn collect_models(items: &[syn::Item], models: &mut Vec<ModelInfo>) {
     for item in items {
         match item {
-            syn::Item::Struct(item)
-                if matches!(&item.vis, syn::Visibility::Public(_)) && is_model(&item.attrs) =>
-            {
-                models.extend(model_info(item));
-            }
+            syn::Item::Struct(item) if is_model(&item.attrs) => models.push(item),
             syn::Item::Mod(syn::ItemMod {
                 content: Some((_, items)),
                 ..
-            }) => collect_models(items, models),
+            }) => models.extend(model_structs(items)),
             _ => {}
         }
     }
+    models
 }
 
 fn model_info(model: &syn::ItemStruct) -> Option<ModelInfo> {
     let struct_name = model.ident.to_string();
     let options = TideormOptions::of(&model.attrs);
-    let table = options
-        .table
-        .clone()
-        .unwrap_or_else(|| crate::utils::pluralize(&crate::utils::to_snake_case(&struct_name)));
+    let table = options.table(&struct_name);
     let named_fields = match &model.fields {
         syn::Fields::Named(fields) => &fields.named,
         _ => return None,
@@ -251,7 +218,7 @@ fn is_model_attribute(path: &syn::Path) -> bool {
             && path.segments[1].ident == "model")
 }
 
-fn is_model(attributes: &[syn::Attribute]) -> bool {
+pub(crate) fn is_model(attributes: &[syn::Attribute]) -> bool {
     attributes.iter().any(|attribute| {
         let path = attribute.path();
         is_model_attribute(path)
@@ -273,14 +240,13 @@ fn is_model(attributes: &[syn::Attribute]) -> bool {
 /// The options of an item's `#[tideorm(..)]` and `#[tideorm::model(..)]`
 /// attributes.
 #[derive(Default)]
-struct TideormOptions {
-    /// The name of every option, with a value or without.
-    names: Vec<String>,
-    table: Option<String>,
+pub(crate) struct TideormOptions {
+    /// Every option's name, and its value when that is a string literal.
+    options: Vec<(String, Option<String>)>,
 }
 
 impl TideormOptions {
-    fn of(attributes: &[syn::Attribute]) -> Self {
+    pub(crate) fn of(attributes: &[syn::Attribute]) -> Self {
         let mut options = Self::default();
         for attribute in attributes {
             let path = attribute.path();
@@ -293,22 +259,44 @@ impl TideormOptions {
                     .get_ident()
                     .map(ToString::to_string)
                     .unwrap_or_default();
-                if name == "table" {
-                    options.table = Some(meta.value()?.parse::<syn::LitStr>()?.value());
-                } else if meta.input.peek(syn::Token![=]) {
-                    let _: syn::Expr = meta.value()?.parse()?;
+                let mut value = None;
+                if meta.input.peek(syn::Token![=]) {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(literal),
+                        ..
+                    }) = meta.value()?.parse::<syn::Expr>()?
+                    {
+                        value = Some(literal.value());
+                    }
                 } else if !meta.input.is_empty() && !meta.input.peek(syn::Token![,]) {
                     let _: proc_macro2::TokenTree = meta.input.parse()?;
                 }
-                options.names.push(name);
+                options.options.push((name, value));
                 Ok(())
             });
         }
         options
     }
 
-    fn has(&self, name: &str) -> bool {
-        self.names.iter().any(|option| option == name)
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.options.iter().any(|(option, _)| option == name)
+    }
+
+    /// The string value of the option `name`.
+    pub(crate) fn value(&self, name: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(option, _)| option == name)
+            .and_then(|(_, value)| value.as_deref())
+    }
+
+    /// The model's table: `table = ".."`, or its struct name, snake-cased
+    /// and pluralized, as the derive names it.
+    pub(crate) fn table(&self, struct_name: &str) -> String {
+        self.value("table").map_or_else(
+            || crate::derive_names::table_name(struct_name),
+            str::to_string,
+        )
     }
 }
 
