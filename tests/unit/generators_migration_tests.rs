@@ -465,6 +465,19 @@ fn test_a_unique_column_is_added_as_unique_on_every_driver() {
     }
 }
 
+/// An `i8` field was a `SMALLINT` on MySQL, which holds values the model
+/// cannot read, and was refused on PostgreSQL; TideORM now writes it per backend.
+#[test]
+fn test_an_i8_field_is_a_tiny_integer_on_every_backend() {
+    for driver in ["postgres", "mysql", "sqlite"] {
+        let content = create_users_table(&config(driver), &["code:i8"]);
+        assert!(
+            content.contains("t.column(\"code\", ColumnType::TinyInteger).not_null();"),
+            "{driver}: {content}"
+        );
+    }
+}
+
 /// An `i16` key numbered by the database got a `BIGSERIAL`/`BIGINT` column,
 /// which the driver refuses to read into the model's `i16`.
 #[test]

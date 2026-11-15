@@ -259,7 +259,8 @@ impl FieldDefinition {
                 ColumnType::String(StringLen::None)
             }
             "text" => ColumnType::Text,
-            "i8" | "tinyint" | "i16" | "smallint" => ColumnType::SmallInteger,
+            "i8" | "tinyint" => ColumnType::TinyInteger,
+            "i16" | "smallint" => ColumnType::SmallInteger,
             "i32" | "int" | "integer" => ColumnType::Integer,
             "i64" | "bigint" => ColumnType::BigInteger,
             "f32" | "float" => ColumnType::Float,
@@ -315,13 +316,6 @@ impl FieldDefinition {
             return Err(format!(
                 "Field '{}' is a {}, which only PostgreSQL supports (this project uses {}). Store the list in a `json` field instead.",
                 self.name, self.field_type, driver
-            ));
-        }
-
-        if postgres && matches!(self.field_type.to_lowercase().as_str(), "i8" | "tinyint") {
-            return Err(format!(
-                "Field '{}' is an i8, which the PostgreSQL driver cannot bind. Use i16 (smallint) instead.",
-                self.name
             ));
         }
 

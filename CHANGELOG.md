@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.3
+
+- Its lockfile builds on TideORM `0.17.7`.
+- An `i8` field (`tinyint`) gets a `TinyInteger` column: `TINYINT` on MySQL and MariaDB, where it
+  was a `SMALLINT` that let a batch update store a value the model could not read back, and
+  `SMALLINT` on PostgreSQL, where `make model` and `make migration` no longer refuse it.
+
 ## 0.12.2
 
 - Its lockfile builds on TideORM `0.17.5`.

@@ -388,6 +388,11 @@ impl<'a> MigrationGenerator<'a> {
             }
             ColumnType::Array(item) if **item == ColumnType::Integer => "integer_array",
             ColumnType::Array(item) if **item == ColumnType::Text => "text_array",
+            // The field's own width where the backend has it (`TINYINT`), which
+            // refuses a value the model cannot read; `SMALLINT` on PostgreSQL.
+            ColumnType::TinyInteger => {
+                return format!("t.{add}({name:?}, ColumnType::TinyInteger)");
+            }
             other => {
                 let sql = column_type_sql(other, database_type(&self.config.database.driver));
                 return format!("t.{add}({name:?}, ColumnType::custom({sql:?}))");
