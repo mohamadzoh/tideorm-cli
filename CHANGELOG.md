@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0
+
+- Builds on TideORM `0.18.0`, a breaking release, and the projects `tideorm init` scaffolds
+  require it: a column name two result columns share is an error, a raw fragment refuses `$1`,
+  and SQLite reads `"name"` as an identifier only (see TideORM's changelog).
+
 ## 0.12.3
 
 - Its lockfile builds on TideORM `0.17.7`.
