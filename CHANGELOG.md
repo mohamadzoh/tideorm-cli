@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.1
+
+- Dependencies: `toml` 1, `minijinja` 3, `pluralizer` 0.6 and `syn` 3, so a build compiles one
+  `syn` and one `toml`, the versions `tideorm-macros` uses. Generated names are unchanged:
+  `pluralizer` 0.6 gives the same plural for every word tried (over 22,000).
+
 ## 0.13.0
 
 - Builds on TideORM `0.18.0`, a breaking release, and the projects `tideorm init` scaffolds

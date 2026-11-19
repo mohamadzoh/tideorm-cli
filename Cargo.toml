@@ -1,6 +1,6 @@
 [package]
 name = "tideorm-cli"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 description = "Command-line interface for TideORM"
 authors = ["Mohamad Al Zohbie"]
@@ -23,7 +23,7 @@ tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "sync"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.9.8"
+toml = "1.2.1"
 
 # Time
 chrono = "0.4.44"
@@ -33,7 +33,7 @@ colored = "3.1.1"
 
 # Regex for parsing
 regex = "1.12.3"
-syn = { version = "2.0.117", features = ["full", "visit"] }
+syn = { version = "3.0.9", features = ["full", "visit"] }
 # Token trees of the model attributes `tideorm models` skips; source lines for `tideorm analyze`
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 
@@ -46,10 +46,10 @@ unicode-segmentation = "1.13.3"
 url = "2.5.8"
 
 # Pluralization
-pluralizer = "0.5.0"
+pluralizer = "0.6.0"
 
 # Template engine for code generation
-minijinja = "2.18.0"
+minijinja = { version = "3.1.0", features = ["serde"] }
 
 # Interactive prompts; the default `editor` prompt is unused and would pull in tempfile
 dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }

@@ -2,7 +2,7 @@
 
 use crate::config::canonical_driver;
 use colored::Colorize;
-use minijinja::{AutoEscape, Environment};
+use minijinja::{AutoEscape, Environment, value::Serde};
 use serde::Serialize;
 use std::path::Path;
 use tideorm::config::DatabaseType;
@@ -233,7 +233,7 @@ pub fn render_template<T: Serialize>(
 
     env.get_template(template_name)
         .map_err(|error| format!("Failed to load {} template: {}", template_name, error))?
-        .render(context)
+        .render(Serde(context))
         .map_err(|error| format!("Failed to render {} template: {}", template_name, error))
 }
 
