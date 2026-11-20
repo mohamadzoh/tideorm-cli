@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.2
+
+- Builds on TideORM `0.18.2`, and the projects `tideorm init` scaffolds require it: on SQLite
+  3.54 a long `where_in` list on a JSON column no longer fails with "VIEWs and/or subqueries
+  nested too deep".
+
 ## 0.13.1
 
 - Dependencies: `toml` 1, `minijinja` 3, `pluralizer` 0.6 and `syn` 3, so a build compiles one
